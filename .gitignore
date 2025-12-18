@@ -1,6 +1,19 @@
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
 
+.tmp_flash_attn
+
+*.o
+*.cc
+
+HunyuanVideo-1.5/assets
+HunyuanVideo-1.5/ckpts
+HunyuanVideo-1.5/ComfyUI
+HunyuanVideo-1.5/flash-attention
+HunyuanVideo-1.5/flex-block-attn
+HunyuanVideo-1.5/outputs
+HunyuanVideo-1.5/SageAttention
+
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/

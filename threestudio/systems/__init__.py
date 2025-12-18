@@ -1,6 +1,7 @@
 from . import (
     control4d_multiview,
     dreamfusion,
+    dreamfusion_hunyuanvideo,
     eff_dreamfusion,
     fantasia3d,
     imagedreamfusion,

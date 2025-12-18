@@ -23,7 +23,7 @@ from threestudio.utils.typing import *
 class StableDiffusionSDIGuidance(BaseObject):
     @dataclass
     class Config(BaseObject.Config):
-        pretrained_model_name_or_path: str = "stabilityai/stable-diffusion-2-1-base"
+        pretrained_model_name_or_path: str = "Manojb/stable-diffusion-2-1-base"
         enable_memory_efficient_attention: bool = False
         enable_sequential_cpu_offload: bool = False
         enable_attention_slicing: bool = False

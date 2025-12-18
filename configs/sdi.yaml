@@ -61,13 +61,13 @@ system:
 
   prompt_processor_type: "stable-diffusion-prompt-processor"
   prompt_processor:
-    pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1-base"
+    pretrained_model_name_or_path: "Manojb/stable-diffusion-2-1-base"
     prompt: ???
     use_perp_neg: true
 
   guidance_type: "stable-diffusion-sdi-guidance"
   guidance:
-    pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1-base"
+    pretrained_model_name_or_path: "Manojb/stable-diffusion-2-1-base"
     guidance_scale: 7.5
     weighting_strategy: sds
     min_step_percent: 0.25

@@ -1,0 +1,111 @@
+# Pre-steps (run before this file):
+#
+# install HunyuanVideo dependencies:
+#   git clone https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5.git
+#   cd HunyuanVideo-1.5
+#   pip install -r requirements.txt
+#   pip install -i https://mirrors.tencent.com/pypi/simple/ --upgrade tencentcloud-sdk-python
+#
+# install Flash Attention 2 (needed for compatibility with ThreestudioWithHunyuanVideo):
+#   git clone https://github.com/Dao-AILab/flash-attention.git
+#   cd flash-attention
+#   pip install flash-attn --no-build-isolation
+#   or
+#   python setup.py install
+#
+# install other build deps:
+#   pip install pybind11
+#   pip install --no-build-isolation pysdf
+#
+# Then:
+#   pip install --no-build-isolation -r requirements_with_HunyuanVideo.txt --no-deps
+#
+# If you prefer a single command (with deps), install lightning dependencies too:
+#   pip install lightning==2.0.0 pytorch-lightning==2.0.0 \
+#     "arrow<3,>=1.2" "beautifulsoup4<6,>=4.8" "click<10" "croniter<1.4,>=1.3" \
+#     "dateutils<2" "deepdiff<8,>=5.7" "fastapi<0.89" "inquirer<5,>=2.10" \
+#     "lightning-cloud>=0.5.31" "rich<15,>=12.3" "starlette<2" "starsessions<2,>=1.2.1" \
+#     "traitlets<7,>=5.3" "uvicorn<2" "websocket-client<3" "websockets<12" \
+#     "fsspec[http]<2025.0,>=2022.5.0" "packaging<25" "psutil<7.0"
+#
+# Then:
+# 可选：降低 pillow 到 10.x 以满足 gradio 要求
+# pip install "pillow<11"
+#
+# pip install aiofiles "altair<6,>=4.2" ffmpy gradio-client==0.7.3 "importlib-resources<7" "orjson~=3.0" pydub "semantic-version~=2.0" tomlkit==0.12.0 "typer[all]<1,>=0.9" decorator jedi matplotlib-inline pexpect stack_data comm "jupyterlab_widgets~=3.0" "widgetsnbextension~=4.0" "kornia_rs>=0.1.9" contourpy cycler fonttools kiwisolver pyparsing absl-py grpcio markdown tensorboard-data-server werkzeug "gitpython!=3.1.29,>=1.0.0" platformdirs sentry-sdk opencv-python-headless scikit-image scipy timm "markupsafe~=2.1" "pydantic>=2.0"
+# pip install "numpy<2.0" "aiofiles<24.0" "fastapi>=0.100.0"
+# pip install "opencv-python<4.10.0" "opencv-python-headless<4.10.0" "lightning>=2.1.0"
+#
+# pip uninstall libigl -y
+# pip install libigl==2.5.1
+
+
+
+
+
+
+# Compatible with the current ThreestudioWithHunyuanVideo env (torch==2.6.0, torchvision==0.21.0, torchaudio==2.6.0, diffusers==0.35.0, transformers==4.57.1, accelerate==1.12.0).
+# Pins avoid pulling newer torch wheels and add build deps needed by pysdf.
+
+# Core / Torch stack
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+accelerate==1.12.0
+diffusers==0.35.0
+transformers==4.57.1
+lightning==2.0.0
+pytorch-lightning==2.0.0
+omegaconf==2.3.0
+jaxtyping
+typeguard
+pybind11  # for pysdf build
+
+# Rendering / NeRF
+git+https://github.com/KAIR-BAIR/nerfacc.git@v0.5.2
+git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
+git+https://github.com/NVlabs/nvdiffrast.git
+libigl
+xatlas
+trimesh[easy]
+networkx==3.4.2
+pysdf
+PyMCubes
+
+# Vision / IO
+opencv-python
+matplotlib
+tensorboard
+imageio>=2.28.0
+imageio[ffmpeg]
+pillow
+
+# Training / logging
+wandb
+torchmetrics
+
+# UI
+gradio==4.11.0
+IPython
+ipywidgets
+
+# Text & model utils
+safetensors==0.7.0
+huggingface_hub==0.34.0
+sentencepiece
+
+# Optional: DeepFloyd IF / attention / quantization
+# xformers
+# bitsandbytes>=0.43.3
+
+# Zero123 / CLIP
+einops==0.8.1
+kornia
+taming-transformers-rom1504
+git+https://github.com/openai/CLIP.git
+
+# ControlNet
+controlnet_aux
+
+# Lighting / environment maps
+git+https://github.com/ashawkey/envlight.git
