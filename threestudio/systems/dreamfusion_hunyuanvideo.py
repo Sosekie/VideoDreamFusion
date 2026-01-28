@@ -1,6 +1,8 @@
 import math
 from dataclasses import dataclass, field
 
+import numpy as np
+
 import torch
 import torch.nn.functional as F
 
@@ -22,7 +24,9 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
     @dataclass
     class Config(BaseLift3DSystem.Config):
         n_arc_views: int = 8
-        arc_span_deg: float = 90.0
+        arc_span_deg: float = 360.0
+        arc_direction: str = "cw"  # "cw" or "ccw"
+        fix_elevation: bool = False
 
     cfg: Config
 
@@ -62,10 +66,13 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
         device = batch["rays_o"].device
         num_views = self.cfg.n_arc_views
         arc_span_deg = self.cfg.arc_span_deg
+        signed_span = -abs(arc_span_deg) if self.cfg.arc_direction.lower() == "cw" else abs(arc_span_deg)
 
+        new_epoch = False
         if self._arc_epoch != self.true_current_epoch or self._arc_start_azimuth_deg is None:
             self._arc_epoch = self.true_current_epoch
             self._arc_start_azimuth_deg = float(torch.rand(1).item() * 360.0)
+            new_epoch = True
 
         cam_cfg = self._camera_cfg()
         cam_dist_range = (
@@ -84,6 +91,9 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
             cam_cfg.light_position_perturb if cam_cfg is not None else 1.0
         )
         rays_d_normalize = cam_cfg.rays_d_normalize if cam_cfg is not None else True
+        elev_range = (
+            cam_cfg.elevation_range if cam_cfg is not None else (-10.0, 45.0)
+        )
 
         height = int(batch.get("height", getattr(self.dataset, "height", 64)))
         width = int(batch.get("width", getattr(self.dataset, "width", 64)))
@@ -101,11 +111,18 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
 
         azimuth_deg = torch.linspace(
             self._arc_start_azimuth_deg,
-            self._arc_start_azimuth_deg + arc_span_deg,
+            self._arc_start_azimuth_deg + signed_span,
             num_views,
             device=device,
         )
-        elevation_deg = torch.zeros(num_views, device=device)
+        if getattr(self.cfg, "fix_elevation", False):
+            elevation_deg = torch.zeros(num_views, device=device)
+        else:
+            elevation_deg = (
+                torch.zeros(num_views, device=device).uniform_(
+                    float(elev_range[0]), float(elev_range[1])
+                )
+            )
         elevation = elevation_deg * math.pi / 180.0
         azimuth = azimuth_deg * math.pi / 180.0
 
@@ -200,8 +217,16 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
         )
         proj_mtx = get_projection_matrix(
             fovy, float(width) / float(height), 0.01, 100.0
-        )
+        ).to(device)
         mvp_mtx = get_mvp_matrix(c2w, proj_mtx)
+
+        if new_epoch:
+            threestudio.info(
+                f"Arc views epoch {self._arc_epoch}: "
+                f"azimuth_deg={azimuth_deg.detach().cpu().tolist()}, "
+                f"elevation_deg={elevation_deg.detach().cpu().tolist()}, "
+                f"camera_distance={camera_distance.item():.3f}"
+            )
 
         return {
             "index": torch.arange(num_views, device=device),
@@ -223,9 +248,55 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
     def training_step(self, batch, batch_idx):
         multi_view_batch = self._prepare_arc_batch(batch)
         out = self(multi_view_batch)
+
+        comp_rgb = out["comp_rgb"]
+        if comp_rgb.dim() != 4 or comp_rgb.shape[-1] != 3:
+            raise ValueError(
+                f"Expected comp_rgb with shape [N, H, W, 3], got {comp_rgb.shape}"
+            )
+
+        # Split batch dimension (B) and temporal sweep length (T = n_arc_views)
+        # so downstream video guidance can consume (B, 3, T, H, W).
+        T = self.cfg.n_arc_views
+        total_views, H, W, _ = comp_rgb.shape
+        if total_views % T != 0:
+            raise ValueError(
+                f"Total rendered views {total_views} not divisible by n_arc_views {T}"
+            )
+        B = total_views // T
+        comp_rgb_video = (
+            comp_rgb.view(B, T, H, W, 3).permute(0, 4, 1, 2, 3).contiguous()
+        )
+        out["comp_rgb"] = comp_rgb_video
+
+        # Debug panel: save video batch as B rows x T cols mosaic for quick inspection.
+        rows = []
+        for b in range(B):
+            cols = []
+            for t in range(T):
+                frame_chw = comp_rgb_video[b, :, t, :, :].detach().cpu().numpy()
+                frame_hwc = (
+                    np.clip(frame_chw, 0.0, 1.0).transpose(1, 2, 0) * 255.0
+                ).astype(np.uint8)
+                cols.append(frame_hwc)
+            rows.append(np.concatenate(cols, axis=1))
+        panel = np.concatenate(rows, axis=0)
+        self.save_image(f"it{self.true_global_step}-panel.png", panel)
+
+        # If still using SD guidance, fall back to per-frame images (N, H, W, 3).
+        if self.cfg.guidance_type == "stable-diffusion-guidance":
+            comp_rgb_for_guidance = (
+                comp_rgb_video.permute(0, 2, 3, 4, 1).reshape(total_views, H, W, 3)
+            )
+        else:
+            comp_rgb_for_guidance = out["comp_rgb"]  # expected to be (B, 3, T, H, W)
+
         prompt_utils = self.prompt_processor()
         guidance_out = self.guidance(
-            out["comp_rgb"], prompt_utils, **multi_view_batch, rgb_as_latents=False
+            comp_rgb_for_guidance,
+            prompt_utils,
+            **multi_view_batch,
+            rgb_as_latents=False,
         )
 
         loss = 0.0

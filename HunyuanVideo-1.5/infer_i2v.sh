@@ -2,14 +2,21 @@
 # Simple inference script for HunyuanVideo-1.5 I2V
 
 # Configuration
-IMAGE_PATH="${1:-dog.png}"
-PROMPT="${2:-a 3d model of dog, 360 degree turntable rotation}"
-OUTPUT_PATH="${3:-./outputs/output_i2v_$(echo $PROMPT | tr ' ' '_').mp4}"
+# Text-to-video cfg-distill (480p_t2v_distilled); image optional but unused.
+MODEL_TYPE="HunyuanVideo-1.5-480P-T2V-cfg-distill"
+IMAGE_PATH="${1:-}"
+PROMPT="${2:-A cinematic video of a hamburger. The vertical camera angle is fixed at 0 degrees (eye-level), while the horizontal camera rotates clockwise a full 360 degrees around the hamburger. The hamburger remains centered in the frame throughout the rotation, with smooth, continuous motion and high visual detail.}"
+safe_name=$(echo "$PROMPT" | tr ' ' '_' | tr -cd '[:alnum:]_.' )
+safe_hash=$(echo -n "$PROMPT" | md5sum | cut -c1-8)
+OUTPUT_PATH="${3:-./outputs/output_i2v_${safe_name:0:80}-${safe_hash}.mp4}"
 MODEL_PATH="./ckpts"
 RESOLUTION="480p"
-NUM_STEPS=12  # Use 8 or 12 for step-distilled model (recommended: 12)
+NUM_STEPS=50  # cfg-distill; guidance_scale=1 typically
+VIDEO_LENGTH=1
+ASPECT_RATIO="1:1"
 SEED=42
-ENABLE_STEP_DISTILL=true  # Enable step-distilled model for faster inference
+ENABLE_STEP_DISTILL=false  # cfg-distill model (not step-distilled)
+CFG_DISTILLED=true
 
 # Memory optimization settings
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"
@@ -28,7 +35,7 @@ echo "╚═══════════════════════�
 echo ""
 
 # Check if image exists
-if [ ! -f "$IMAGE_PATH" ]; then
+if [ -n "$IMAGE_PATH" ] && [ ! -f "$IMAGE_PATH" ]; then
     echo "❌ Error: Image not found at $IMAGE_PATH"
     echo "   Current directory: $(pwd)"
     echo "   Looking for: $(cd $(dirname $IMAGE_PATH) 2>/dev/null && pwd)/$(basename $IMAGE_PATH)"
@@ -43,10 +50,10 @@ if [ ! -d "$MODEL_PATH" ]; then
     exit 1
 fi
 
-# Check required subfolders for 480p I2V
+# Check required subfolders for 480p t2v cfg-distilled
 missing=()
 for p in \
-    "$MODEL_PATH/transformer/480p_i2v" \
+    "$MODEL_PATH/transformer/480p_t2v_distilled" \
     "$MODEL_PATH/scheduler" \
     "$MODEL_PATH/vae" \
     "$MODEL_PATH/text_encoder/llm" \
@@ -61,8 +68,8 @@ if [ ${#missing[@]} -ne 0 ]; then
         echo "   - $p"
     done
     echo ""
-    echo "Download 480p I2V model:"
-    echo "  hf download tencent/HunyuanVideo-1.5 --include 'transformer/480p_i2v/*' --local-dir ./ckpts"
+    echo "Download 480p T2V cfg-distilled model:"
+    echo "  hf download tencent/HunyuanVideo-1.5 --include 'transformer/480p_t2v_distilled/*' --local-dir ./ckpts"
     echo ""
     echo "Or download everything (recommended):"
     echo "  bash download_models.sh <your_hf_token>"
@@ -73,11 +80,15 @@ fi
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 
 echo "📋 Configuration:"
-echo "  Image:        $(realpath $IMAGE_PATH)"
+echo "  Image:        ${IMAGE_PATH:+$(realpath $IMAGE_PATH)}"
 echo "  Prompt:       $PROMPT"
 echo "  Resolution:   $RESOLUTION"
 echo "  Steps:        $NUM_STEPS"
+echo "  Video Length: $VIDEO_LENGTH"
 echo "  Step Distill: $ENABLE_STEP_DISTILL"
+echo "  Model Type:   $MODEL_TYPE"
+echo "  CFG Distill:  $CFG_DISTILLED"
+echo "  Aspect Ratio: ${ASPECT_RATIO:-16:9}"
 echo "  Output:       $(realpath $OUTPUT_PATH)"
 echo "  Force Torch Attn: $FORCE_TORCH_ATTN"
 echo "  Force Flash2:     $FORCE_FLASH2"
@@ -89,14 +100,17 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 
 python generate.py \
-    --image_path "$IMAGE_PATH" \
+    ${IMAGE_PATH:+--image_path "$IMAGE_PATH"} \
     --prompt "$PROMPT" \
     --model_path "$MODEL_PATH" \
     --resolution "$RESOLUTION" \
+    ${ASPECT_RATIO:+--aspect_ratio "$ASPECT_RATIO"} \
     --num_inference_steps $NUM_STEPS \
+    --video_length $VIDEO_LENGTH \
     --seed $SEED \
     --output_path "$OUTPUT_PATH" \
     --enable_step_distill $ENABLE_STEP_DISTILL \
+    --cfg_distilled $CFG_DISTILLED \
     --sr false \
     --rewrite false
 EXIT_CODE=$?

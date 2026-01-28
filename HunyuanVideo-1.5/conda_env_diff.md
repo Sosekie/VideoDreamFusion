@@ -4,6 +4,7 @@ H100, CUDA126, FlashAttention-3 beta failed, FlashAttention-2 succeed
 
 - ThreestudioWithHunyuanVideo
 从现有的HunyuanVideoThreestudio_CUDA126克隆而来，配置threestudio所需库
+完美运行
 
 - HunyuanVideoThreestudio_CUDA126_H100_normalFlashAttention
 H100, CUDA126, normalFlashAttention（失败了）

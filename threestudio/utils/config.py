@@ -95,7 +95,19 @@ class ExperimentConfig:
                     )
                 else:
                     self.timestamp = datetime.now().strftime("@%Y%m%d-%H%M%S")
-        self.trial_name += self.timestamp
+        full_name = self.trial_name + self.timestamp
+        # avoid overlong filesystem paths by truncating very long trial names
+        max_name_len = 120
+        if len(full_name) > max_name_len:
+            import hashlib
+
+            digest = hashlib.md5(full_name.encode()).hexdigest()[:8]
+            keep_len = max_name_len - len(digest) - 1
+            keep_len = max(1, keep_len)
+            truncated = full_name[:keep_len]
+            self.trial_name = f"{truncated}-{digest}"
+        else:
+            self.trial_name = full_name
         self.exp_dir = os.path.join(self.exp_root_dir, self.name)
         self.trial_dir = os.path.join(self.exp_dir, self.trial_name)
         os.makedirs(self.trial_dir, exist_ok=True)

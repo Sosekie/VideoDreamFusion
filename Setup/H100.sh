@@ -7,9 +7,36 @@ GPU_TYPE=${GPU_TYPE:-h100}
 MAIL_ADDR=${MAIL_ADDR:-chenrui_fan@outlook.com}
 ACCOUNT=${ACCOUNT:-gratis}  # 默认账户: gratis
 
+GRATIS_MEM="64G"
+PREEMPT_MEM="90G"
+DEBUG_MEM="64G"
+GRATIS_GMIN_LIMIT=86400  # job_gratis 的 mem×时间 上限 (G-min)
+
 # GPU资源查看命令 (允许缺失)
 gpu-usage 2>/dev/null || echo "(提示) gpu-usage 命令不可用，忽略"
 squeue -u $USER
+
+enforce_gratis_runtime_limit() {
+  local hours="$1"
+  local mem_str="$2"
+  local mem_gb=${mem_str%G}
+  local required_gmin=$((mem_gb * hours * 60))
+
+  if [ "$required_gmin" -le $GRATIS_GMIN_LIMIT ]; then
+    echo "$hours"
+    return
+  fi
+
+  local max_hours_allowed=$((GRATIS_GMIN_LIMIT / (mem_gb * 60)))
+  if [ "$max_hours_allowed" -lt 1 ]; then
+    echo "⚠️ job_gratis mem×时间超过 ${GRATIS_GMIN_LIMIT} G-min (内存 ${mem_str})，请降低内存。" >&2
+    echo 1
+    return
+  fi
+
+  echo "⚠️ job_gratis mem×时间超过 ${GRATIS_GMIN_LIMIT} G-min，自动调整申请时长为 ${max_hours_allowed} 小时。" >&2
+  echo "$max_hours_allowed"
+}
 
 echo "=========================================="
 echo "选择GPU交互式会话方案： (目标: H100)"
@@ -32,7 +59,7 @@ read -p "请选择方案 (1-4, 默认1): " choice
 choice=${choice:-1}
 
 case $choice in
-  1) DEFAULT_HOURS=24; MAX_HOURS=24 ;;      # job_gratis 通常限制 24h
+  1) DEFAULT_HOURS=22; MAX_HOURS=24 ;;      # job_gratis 默认 22h，避免 mem×时间 超限
   2) DEFAULT_HOURS=24; MAX_HOURS=24 ;;      # job_gpu_preemptable 限制 24h (UBELIX Update)
   3) DEFAULT_HOURS=0.5; MAX_HOURS=0.5 ;;   # Debug 30min
   4) DEFAULT_HOURS=24; MAX_HOURS=24 ;;      # 备选
@@ -46,6 +73,9 @@ if [ "$choice" != "3" ]; then
   if ! [[ "$hours" =~ ^[0-9]+$ ]] || [ "$hours" -lt 1 ] || [ "$hours" -gt $MAX_HOURS ]; then
     echo "⚠️ 无效的时长，使用默认值: ${DEFAULT_HOURS}小时"
     hours=$DEFAULT_HOURS
+  fi
+  if [ "$choice" = "1" ]; then
+    hours=$(enforce_gratis_runtime_limit "$hours" "$GRATIS_MEM")
   fi
   TIME_FORMAT=$(printf "%02d:00:00" $hours)
   echo "✅ 设置申请时长为: ${hours}小时 (${TIME_FORMAT})"
@@ -99,21 +129,21 @@ case $choice in
     echo "优点: 标准免费交互式QoS"
     echo "缺点: 资源可能受限"
     echo "申请时长: ${hours}小时"
-    do_interactive gpu job_gratis job_gratis ${hours} ${TIME_FORMAT} "64G" ""
+    do_interactive gpu job_gratis job_gratis ${hours} ${TIME_FORMAT} "${GRATIS_MEM}" ""
     ;;
   2)
     echo "🚀 使用 job_gpu_preemptable QoS"
     echo "优点: 抢占式资源，排队成功率高"
     echo "缺点: 可能被抢占"
     echo "申请时长: ${hours}小时"
-    do_interactive gpu-invest job_gpu_preemptable job_gpu_preemptable ${hours} ${TIME_FORMAT} "90G" "• 注意：该 QoS 可能被高优先级任务抢占"
+    do_interactive gpu-invest job_gpu_preemptable job_gpu_preemptable ${hours} ${TIME_FORMAT} "${PREEMPT_MEM}" "• 注意：该 QoS 可能被高优先级任务抢占"
     ;;
   3)
     echo "⚡ 使用 job_debug QoS"
     echo "优点: 快速获得资源"
     echo "缺点: 时长限制 30 分钟"
     echo "申请时长: 30分钟 (固定)"
-    do_interactive gpu job_debug job_debug ${hours} ${TIME_FORMAT} "64G" "• Debug 模式：时间限制 30 分钟"
+    do_interactive gpu job_debug job_debug ${hours} ${TIME_FORMAT} "${DEBUG_MEM}" "• Debug 模式：时间限制 30 分钟"
     ;;
   4)
     echo "📊 当前资源状况："
@@ -127,13 +157,13 @@ case $choice in
     echo "- job_debug (30分钟)"
     read -p "是否直接使用推荐的 job_gpu_preemptable QoS? (y/n): " confirm
     if [[ $confirm == "y" || $confirm == "Y" ]]; then
-      do_interactive gpu-invest job_gpu_preemptable job_gpu_preemptable ${hours} ${TIME_FORMAT} "90G" "• 注意：该 QoS 可能被高优先级任务抢占"
+      do_interactive gpu-invest job_gpu_preemptable job_gpu_preemptable ${hours} ${TIME_FORMAT} "${PREEMPT_MEM}" "• 注意：该 QoS 可能被高优先级任务抢占"
     else
       echo "请重新运行脚本选择其他方案"
     fi
     ;;
   *)
     echo "❌ 无效选择，使用默认方案 job_gratis"
-    do_interactive gpu job_gratis job_gratis ${hours} ${TIME_FORMAT} "64G" ""
+    do_interactive gpu job_gratis job_gratis ${hours} ${TIME_FORMAT} "${GRATIS_MEM}" ""
     ;;
  esac

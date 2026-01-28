@@ -381,6 +381,8 @@ https://user-images.githubusercontent.com/19284678/236694848-38ae4ea4-554b-4c9d-
 python launch.py --config configs/dreamfusion-if.yaml --train --gpu 0 system.prompt_processor.prompt="a delicious hamburger" system.background.random_aug=true
 # uses StableDiffusion, requires ~6GB VRAM in training
 python launch.py --config configs/dreamfusion-sd.yaml --train --gpu 0 system.prompt_processor.prompt="a delicious hamburger"
+# uses HunyuanVideo
+python launch.py --config configs/dreamfusion-hunyuanvideo.yaml --train --gpu 0 system.prompt_processor.prompt="A cinematic video of a hamburger. The vertical camera angle is fixed at 0 degrees (eye-level), while the horizontal camera rotates clockwise a full 360 degrees around the hamburger. The hamburger remains centered in the frame throughout the rotation, with smooth, continuous motion and high visual detail."
 ```
 
 **Tips**
