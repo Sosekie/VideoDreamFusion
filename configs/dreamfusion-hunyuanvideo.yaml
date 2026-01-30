@@ -6,8 +6,8 @@ seed: 0
 data_type: "random-camera-datamodule"
 data:
   batch_size: 1
-  width: 64
-  height: 64
+  width: 128
+  height: 128
   camera_distance_range: [1.5, 2.0]
   fovy_range: [40, 70]
   elevation_range: [-10, 45]
@@ -21,6 +21,11 @@ system:
   arc_span_deg: 0. # total span degrees
   fix_elevation: false
   arc_direction: "cw"
+  debug_video_interval: 100
+  debug_video_num_steps: 50
+  debug_video_length: null
+  debug_video_use_pipe: true
+  debug_video_use_one_step: true
   geometry_type: "implicit-volume"
   geometry:
     radius: 2.0
@@ -112,7 +117,7 @@ trainer:
   max_steps: 10000
   log_every_n_steps: 1
   num_sanity_val_steps: 0
-  val_check_interval: 1
+  val_check_interval: 100
   enable_progress_bar: true
   precision: 16-mixed
 
@@ -120,5 +125,14 @@ checkpoint:
   save_last: true # save at each validation time
   save_top_k: -1
   every_n_train_steps: ${trainer.max_steps}
+
+
+# echo $TMPDIR
+# mv HunyuanVideo-1.5/ckpts HunyuanVideo-1.5/ckpts.homefs
+# TARGET=${TMPDIR:-/tmp}/HunyuanVideo-1.5/ckpts
+# mkdir -p "$TARGET"
+# rsync -a HunyuanVideo-1.5/ckpts.homefs/ "$TARGET"/
+# ln -s "$TARGET" HunyuanVideo-1.5/ckpts
+# ls HunyuanVideo-1.5/ckpts
 
 # python launch.py --config configs/dreamfusion-hunyuanvideo.yaml --train --gpu 0 system.prompt_processor.prompt="A cinematic video of a hamburger. The vertical camera angle is fixed at 0 degrees (eye-level), while the horizontal camera rotates clockwise a full 360 degrees around the hamburger. The hamburger remains centered in the frame throughout the rotation, with smooth, continuous motion and high visual detail."

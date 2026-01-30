@@ -27,6 +27,11 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
         arc_span_deg: float = 360.0
         arc_direction: str = "cw"  # "cw" or "ccw"
         fix_elevation: bool = False
+        debug_video_interval: int = 0  # 0 to disable; otherwise save every k steps
+        debug_video_num_steps: int = 12
+        debug_video_length: Optional[int] = None
+        debug_video_use_pipe: bool = True
+        debug_video_use_one_step: bool = True
 
     cfg: Config
 
@@ -292,11 +297,27 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
             comp_rgb_for_guidance = out["comp_rgb"]  # expected to be (B, 3, T, H, W)
 
         prompt_utils = self.prompt_processor()
+
+        debug_kwargs = {}
+        if (
+            self.cfg.debug_video_interval > 0
+            and self.true_global_step % self.cfg.debug_video_interval == 0
+        ):
+            debug_kwargs = {
+                "debug_save_dir": self.get_save_path("debug_videos"),
+                "debug_step": self.true_global_step,
+                "debug_pipe": self.cfg.debug_video_use_pipe,
+                "debug_one_step": self.cfg.debug_video_use_one_step,
+                "debug_num_steps": self.cfg.debug_video_num_steps,
+                "debug_video_length": self.cfg.debug_video_length or T,
+            }
+
         guidance_out = self.guidance(
             comp_rgb_for_guidance,
             prompt_utils,
             **multi_view_batch,
             rgb_as_latents=False,
+            **debug_kwargs,
         )
 
         loss = 0.0

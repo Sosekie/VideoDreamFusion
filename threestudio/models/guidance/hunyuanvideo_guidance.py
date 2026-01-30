@@ -6,12 +6,18 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import imageio
+import numpy as np
+import cv2
 
 import threestudio
 from threestudio.models.prompt_processors.base import PromptProcessorOutput
 from threestudio.utils.base import BaseObject
 from threestudio.utils.misc import cleanup
 from threestudio.utils.typing import *
+
+# Global cache to avoid reloading large HunyuanVideo pipelines within the same process
+_PIPE_CACHE = {}
 
 
 @threestudio.register("hunyuanvideo-guidance")
@@ -86,22 +92,42 @@ class HunyuanVideoGuidance(BaseObject):
             step_distilled=step_distilled,
             sparse_attn=self.cfg.sparse_attn,
         )
-        self.pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
+
+        cache_key = (
             self.cfg.pretrained_model_name_or_path,
-            transformer_version=transformer_version,
-            create_sr_pipeline=False,
-            transformer_dtype=self.weights_dtype,
-            device=self.device,
-            transformer_init_device=self.device,
+            transformer_version,
+            self.cfg.use_vision_encoder,
+            str(self.device),
+            self.weights_dtype,
         )
-        self.pipe.to(self.device)
-        self.transformer = self.pipe.transformer.eval()
-        self.vae = self.pipe.vae.eval()
-        self.text_encoder = self.pipe.text_encoder.eval()
-        self.vision_encoder = self.pipe.vision_encoder if self.cfg.use_vision_encoder else None
-        if self.vision_encoder is not None:
-            self.vision_encoder = self.vision_encoder.eval().to(self.device)
-        self.scheduler = self.pipe.scheduler
+        if cache_key in _PIPE_CACHE:
+            self.pipe, self.transformer, self.vae, self.text_encoder, self.vision_encoder, self.scheduler = _PIPE_CACHE[cache_key]
+            threestudio.info("Reusing cached HunyuanVideo pipeline.")
+        else:
+            self.pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
+                self.cfg.pretrained_model_name_or_path,
+                transformer_version=transformer_version,
+                create_sr_pipeline=False,
+                transformer_dtype=self.weights_dtype,
+                device=self.device,
+                transformer_init_device=self.device,
+            )
+            self.pipe.to(self.device)
+            self.transformer = self.pipe.transformer.eval()
+            self.vae = self.pipe.vae.eval()
+            self.text_encoder = self.pipe.text_encoder.eval()
+            self.vision_encoder = self.pipe.vision_encoder if self.cfg.use_vision_encoder else None
+            if self.vision_encoder is not None:
+                self.vision_encoder = self.vision_encoder.eval().to(self.device)
+            self.scheduler = self.pipe.scheduler
+            _PIPE_CACHE[cache_key] = (
+                self.pipe,
+                self.transformer,
+                self.vae,
+                self.text_encoder,
+                self.vision_encoder,
+                self.scheduler,
+            )
         self.num_train_timesteps = len(self.scheduler.timesteps)
         self.set_min_max_steps()
         threestudio.info("Loaded HunyuanVideo pipeline.")
@@ -181,6 +207,13 @@ class HunyuanVideoGuidance(BaseObject):
         camera_distances: Float[Tensor, "B"],
         rgb_as_latents=False,
         guidance_eval=False,
+        debug_save_dir: Optional[str] = None,
+        debug_step: Optional[int] = None,
+        debug_pipe: bool = True,
+        debug_one_step: bool = True,
+        debug_num_steps: int = 12,
+        debug_video_length: Optional[int] = None,
+        debug_panel: bool = True,
         **kwargs,
     ):
         if rgb.dim() != 5:
@@ -312,7 +345,344 @@ class HunyuanVideoGuidance(BaseObject):
             "max_step": self.max_step,
         }
 
+        # Optional debug previews
+        if debug_save_dir is not None and debug_step is not None:
+            pipe_frames, sds_frames = self._debug_save_videos(
+                rgb=rgb,
+                prompt=prompt,
+                latents_noisy=latents_noisy,
+                noise=noise,
+                sigma=sigma,
+                noise_pred=noise_pred,
+                mask_type=mask_type,
+                debug_save_dir=debug_save_dir,
+                debug_step=debug_step,
+                use_pipe=debug_pipe,
+                use_one_step=debug_one_step,
+                num_steps=debug_num_steps,
+                video_length=debug_video_length or T,
+            )
+            if debug_panel:
+                self._debug_save_panel(
+                    rgb=rgb,
+                    rgb_norm=rgb_norm,
+                    video_in=video_in,
+                    posterior=posterior,
+                    latents=latents,
+                    t_int=t_int,
+                    t=t,
+                    sigma=sigma,
+                    noise=noise,
+                    latents_noisy=latents_noisy,
+                    cond_latents=cond_latents,
+                    latents_concat=latents_concat,
+                    noise_pred=noise_pred,
+                    grad=grad,
+                    prompt_embeds=prompt_embeds,
+                    prompt_mask=prompt_mask,
+                    prompt=prompt,
+                    negative_prompt=self.cfg.negative_prompt,
+                    debug_save_dir=debug_save_dir,
+                    debug_step=debug_step,
+                    pipe_frames=pipe_frames,
+                    sds_frames=sds_frames,
+                )
+
         return guidance_out
+
+    @torch.no_grad()
+    def _decode_latents(self, latents: Float[Tensor, "B C T H W"]) -> Float[Tensor, "B C T H W"]:
+        """Decode latents with VAE (no SR, no tiling) into [0,1] videos."""
+        if latents.ndim == 4:
+            latents = latents.unsqueeze(2)
+
+        latents = latents.to(self.vae.dtype)
+        if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
+            latents = latents / self.vae.config.scaling_factor + self.vae.config.shift_factor
+        else:
+            latents = latents / self.vae.config.scaling_factor
+
+        with torch.autocast(device_type="cuda", dtype=self.vae.dtype, enabled=True):
+            self.vae.enable_tiling()
+            video = self.vae.decode(latents, return_dict=False)[0]
+            self.vae.disable_tiling()
+        video = (video / 2 + 0.5).clamp(0, 1)
+        return video
+
+    @staticmethod
+    def _save_video_tensor(video: Float[Tensor, "C T H W"], path: str, fps: int = 24) -> None:
+        video_np = (video.clamp(0, 1).permute(1, 2, 3, 0).cpu().numpy() * 255).astype(np.uint8)
+        imageio.mimwrite(path, video_np, fps=fps)
+
+    @staticmethod
+    def _tile_channels(img_cthw: Float[Tensor, "C T H W"], target_hw: int = 128) -> np.ndarray:
+        # expect torch tensor on any device
+        C, T, H, W = img_cthw.shape
+        imgs = []
+        for t in range(T):
+            slice_c = img_cthw[:, t]  # C,H,W
+            if C == 3:
+                arr = slice_c.permute(1, 2, 0).cpu().numpy()
+            else:
+                # tile channels as 2x2 (or ceil) grid, resized to (H/2,W/2)
+                per = []
+                side = int(np.ceil(np.sqrt(C)))
+                h_small, w_small = max(1, H // 2), max(1, W // 2)
+                for c in range(C):
+                    ch = slice_c[c].unsqueeze(0)  #1,H,W
+                    ch_img = ch.expand(3, -1, -1)
+                    ch_img = F.interpolate(ch_img.unsqueeze(0), size=(h_small, w_small), mode="bilinear", align_corners=False)[0]
+                    per.append(ch_img)
+                # pad to full grid
+                while len(per) < side * side:
+                    per.append(torch.zeros_like(per[0]))
+                rows = []
+                for r in range(side):
+                    row = torch.cat(per[r * side:(r + 1) * side], dim=2)
+                    rows.append(row)
+                grid = torch.cat(rows, dim=1)
+                arr = grid.permute(1, 2, 0).cpu().numpy()
+            arr = np.clip(arr, 0.0, 1.0)
+            # resize each frame to target_hw x target_hw
+            arr = cv2.resize(arr, (target_hw, target_hw), interpolation=cv2.INTER_AREA)
+            imgs.append(arr)
+        # concat frames horizontally
+        return np.concatenate(imgs, axis=1)
+
+    @staticmethod
+    def _scalar_row(text: str, width: int = 400, height: int = 40) -> np.ndarray:
+        canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
+        cv2.putText(canvas, text, (10, height // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+        return canvas
+
+    @torch.no_grad()
+    def _debug_save_panel(
+        self,
+        rgb: Float[Tensor, "B 3 T H W"],
+        rgb_norm: Float[Tensor, "B 3 T H W"],
+        video_in: Float[Tensor, "B 3 T H W"],
+        posterior,
+        latents: Float[Tensor, "B 4 T H W"],
+        t_int: Float[Tensor, "B"],
+        t: Float[Tensor, "B"],
+        sigma: Float[Tensor, ""],
+        noise: Float[Tensor, "B 4 T H W"],
+        latents_noisy: Float[Tensor, "B 4 T H W"],
+        cond_latents: Float[Tensor, "B 4 T H W"],
+        latents_concat: Float[Tensor, "B C T H W"],
+        noise_pred: Float[Tensor, "B C T H W"],
+        grad: Float[Tensor, "B C T H W"],
+        prompt_embeds: Optional[Tensor],
+        prompt_mask: Optional[Tensor],
+        prompt: str,
+        negative_prompt: str,
+        debug_save_dir: str,
+        debug_step: int,
+        pipe_frames: Optional[Tensor],
+        sds_frames: Optional[Tensor],
+    ) -> None:
+        os.makedirs(debug_save_dir, exist_ok=True)
+        rows = []
+        shape_logs = []
+
+        def add_tensor_row(label: str, tensor: Float[Tensor, "..."]):
+            # assume B=1
+            if tensor is None:
+                shape_logs.append(f"{label}: None")
+                return
+            t_cpu = tensor[0].detach().float()
+            if t_cpu.ndim == 4:  # C,T,H,W expected
+                cthw = t_cpu
+            elif t_cpu.ndim >= 5:
+                cthw = t_cpu
+                # try to squeeze trailing singleton dims until 4D
+                while cthw.ndim > 4 and cthw.shape[-1] == 1:
+                    cthw = cthw.squeeze(-1)
+                while cthw.ndim > 4 and cthw.shape[1] == 1:
+                    cthw = cthw.squeeze(1)
+                if cthw.ndim != 4:
+                    shape_logs.append(f"{label}: shape={tuple(t_cpu.shape)} (skipped, ndim={t_cpu.ndim})")
+                    return
+            else:
+                shape_logs.append(f"{label}: shape={tuple(t_cpu.shape)} (skipped, ndim={t_cpu.ndim})")
+                return
+            shape_logs.append(f"{label}: shape={tuple(cthw.shape)}")
+            row_img = self._tile_channels(cthw)
+            # ensure 3 channels
+            if row_img.shape[2] == 1:
+                row_img = np.repeat(row_img, 3, axis=2)
+            rows.append((label, row_img))
+
+        # scalar/info rows
+        rows.append(("num_train_timesteps=len(scheduler.timesteps); min_step; max_step", self._scalar_row(f"num_train_timesteps={self.num_train_timesteps}, min_step={self.min_step}, max_step={self.max_step}")))
+        shape_logs.append(f"num_train_timesteps={self.num_train_timesteps}, min_step={self.min_step}, max_step={self.max_step}")
+        sigma_val = sigma.detach().reshape(-1)[0].item()
+        rows.append(("t_int = randint(min_step, max_step); t = scheduler.timesteps[t_int]; sigma = scheduler.sigmas[t_int]", self._scalar_row(f"t_int={t_int.cpu().tolist()}, t={t.cpu().tolist()}, sigma={sigma_val:.6f}")))
+        shape_logs.append(f"t_int={t_int.cpu().tolist()}, t={t.cpu().tolist()}, sigma={sigma_val:.6f}")
+        rows.append(("prompt", self._scalar_row(f"prompt={prompt} | negative={negative_prompt}", width=800)))
+        shape_logs.append(f"prompt len={len(prompt)}, negative len={len(negative_prompt)}")
+
+        add_tensor_row("rgb", rgb)
+        add_tensor_row("rgb_norm = rgb.clamp(0,1)", rgb_norm)
+        add_tensor_row("video_in = (rgb_norm*2-1).to(weights_dtype)", video_in)
+        add_tensor_row("posterior = vae.encode(video_in)", posterior.latent_dist.mean)
+        add_tensor_row("latents = posterior.latent_dist.sample() * vae.config.scaling_factor", latents)
+        add_tensor_row("noise = randn_like(latents)", noise)
+        add_tensor_row("latents_noisy = latents + sigma*noise", latents_noisy)
+        cond_desc = "cond_latents (t2v: zeros+mask | i2v: encode rgb[0] + mask)"
+        rows.append((cond_desc, self._scalar_row(cond_desc)))
+        shape_logs.append(cond_desc)
+        add_tensor_row("cond_latents", cond_latents)
+        add_tensor_row("latents_concat", latents_concat)
+
+        # Transformer inputs/outputs
+        add_tensor_row("noise_pred (transformer output)", noise_pred)
+
+        # SDS weights / grads (scalar)
+        w_val = float((sigma**2).detach().reshape(-1)[0].item())
+        rows.append(("w = sigma**2", self._scalar_row(f"w={w_val:.6f}")))
+        grad_sample = grad[0].detach()
+        rows.append(("grad = w*(noise_pred-noise) (norm)", self._scalar_row(f"grad_norm={grad_sample.norm().item():.4f}")))
+
+        if prompt_embeds is not None:
+            rows.append(("prompt_embeds", self._scalar_row(f"shape={tuple(prompt_embeds.shape)}, norm={prompt_embeds.norm().item():.3f}")))
+            shape_logs.append(f"prompt_embeds shape={tuple(prompt_embeds.shape)}, norm={prompt_embeds.norm().item():.3f}")
+        if prompt_mask is not None:
+            rows.append(("prompt_mask", self._scalar_row(f"shape={tuple(prompt_mask.shape)}, sum={prompt_mask.sum().item():.3f}")))
+            shape_logs.append(f"prompt_mask shape={tuple(prompt_mask.shape)}, sum={prompt_mask.sum().item():.3f}")
+
+        # assemble panel
+        # helper to add video rows (pipe / sds1step)
+        def add_video_row(label: str, vid: Optional[Tensor]):
+            if vid is None:
+                return
+            C, T, H, W = vid.shape
+            tiles = []
+            for t in range(T):
+                frame = vid[:, t]
+                if C == 3:
+                    img = frame
+                else:
+                    img = frame[0:1].repeat(3, 1, 1)
+                img = img.clamp(0, 1)
+                img = torch.nn.functional.interpolate(
+                    img.unsqueeze(0), size=(128, 128), mode="bilinear", align_corners=False
+                )[0]
+                tiles.append(img)
+            grid = torch.cat(tiles, dim=2)  # concat along width
+            grid_np = (grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            rows.append((label, grid_np))
+
+        add_video_row("pipe video", pipe_frames)
+        add_video_row("sds1step video", sds_frames)
+
+        panel_imgs = []
+        label_w = 1100  # expanded label column width for readability
+        for label, img in rows:
+            h, w, _ = img.shape
+            canvas = np.ones((h, label_w + w, 3), dtype=np.uint8) * 255
+            canvas[:, label_w:, :] = (img * 255 if img.dtype != np.uint8 else img).astype(np.uint8)
+            cv2.putText(canvas, label, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1, cv2.LINE_AA)
+            panel_imgs.append(canvas)
+
+        if panel_imgs:
+            max_w = max(im.shape[1] for im in panel_imgs)
+            padded = []
+            for im in panel_imgs:
+                if im.shape[1] < max_w:
+                    pad_w = max_w - im.shape[1]
+                    im = np.pad(im, ((0, 0), (0, pad_w), (0, 0)), mode="constant", constant_values=255)
+                padded.append(im)
+            panel = np.concatenate(padded, axis=0)
+        save_path = os.path.join(debug_save_dir, f"it{debug_step}-panel.png")
+        imageio.imwrite(save_path, panel)
+        # log shapes to stdout
+        for ln in shape_logs:
+            threestudio.info(f"[panel] {ln}")
+
+    @torch.no_grad()
+    def _debug_save_videos(
+        self,
+        rgb: Float[Tensor, "B 3 T H W"],
+        prompt: str,
+        latents_noisy: Float[Tensor, "B C T H W"],
+        noise: Float[Tensor, "B C T H W"],
+        sigma: Float[Tensor, ""],
+        noise_pred: Float[Tensor, "B C T H W"],
+        mask_type: str,
+        debug_save_dir: str,
+        debug_step: int,
+        use_pipe: bool,
+        use_one_step: bool,
+        num_steps: int,
+        video_length: int,
+    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+        os.makedirs(debug_save_dir, exist_ok=True)
+        aspect = f"{rgb.shape[-1]}:{rgb.shape[-2]}"
+
+        # helper to upsample preview to bucket resolution for comparability
+        def _upsample_to_bucket(video_cthw: Float[Tensor, "C T H W"]) -> Float[Tensor, "C T Hb Wb"]:
+            try:
+                target_h, target_w = self.pipe.get_closest_resolution_given_original_size(
+                    origin_size=(rgb.shape[-1], rgb.shape[-2]), target_size=self.cfg.resolution
+                )
+            except Exception:
+                target_h, target_w = rgb.shape[-2], rgb.shape[-1]
+            if target_h == video_cthw.shape[-2] and target_w == video_cthw.shape[-1]:
+                return video_cthw
+            video_thcw = video_cthw.permute(1, 0, 2, 3)  # T,C,H,W
+            video_up = F.interpolate(
+                video_thcw, size=(target_h, target_w), mode="bilinear", align_corners=False
+            )
+            return video_up.permute(1, 0, 2, 3)
+
+        # Full pipeline generation (multi-step denoise)
+        pipe_frames = None
+        if use_pipe:
+            ref_image = None
+            if mask_type == "i2v":
+                frame = rgb[0, :, 0].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+                ref_image = (frame * 255).astype(np.uint8)
+            try:
+                out = self.pipe(
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                    num_inference_steps=num_steps,
+                    video_length=video_length,
+                    negative_prompt=self.cfg.negative_prompt,
+                    seed=0,
+                    enable_sr=False,
+                    prompt_rewrite=False,
+                    output_type="pt",
+                    reference_image=ref_image,
+                )
+                video_pipe = out.videos[0]  # (C,T,H,W)
+                pipe_path = os.path.join(debug_save_dir, f"it{debug_step}-pipe.mp4")
+                self._save_video_tensor(video_pipe, pipe_path)
+                pipe_frames = video_pipe.cpu()
+            except Exception as e:
+                threestudio.warn(f"Debug pipe generation failed: {e}")
+
+        # Single-step latent -> decode preview (SDS path)
+        sds_frames = None
+        if use_one_step:
+            try:
+                # reconstruct clean latents with known noise and schedule
+                sigma_val = sigma
+                while sigma_val.ndim < latents_noisy.ndim:
+                    sigma_val = sigma_val.unsqueeze(-1)
+                denom = (1.0 - sigma_val).clamp(min=1e-4)
+                x0_est = (latents_noisy - sigma_val * noise) / denom
+                video_1step = self._decode_latents(x0_est)[0]  # (C,T,H,W)
+                video_1step = _upsample_to_bucket(video_1step)
+                one_step_path = os.path.join(debug_save_dir, f"it{debug_step}-sds1step.mp4")
+                self._save_video_tensor(video_1step, one_step_path)
+                sds_frames = video_1step.cpu()
+            except Exception as e:
+                threestudio.warn(f"Debug one-step decode failed: {e}")
+
+        # return frames for panel use
+        return pipe_frames, sds_frames
 
     def destroy(self) -> None:
         cleanup()
