@@ -214,6 +214,7 @@ class HunyuanVideoGuidance(BaseObject):
         debug_num_steps: int = 12,
         debug_video_length: Optional[int] = None,
         debug_panel: bool = True,
+        debug_pipe_steps: int = 1,
         **kwargs,
     ):
         if rgb.dim() != 5:
@@ -347,7 +348,7 @@ class HunyuanVideoGuidance(BaseObject):
 
         # Optional debug previews
         if debug_save_dir is not None and debug_step is not None:
-            pipe_frames, sds_frames = self._debug_save_videos(
+            pipe_frames, sds_frames, pipe_latents, sds_x0_est = self._debug_save_videos(
                 rgb=rgb,
                 prompt=prompt,
                 latents_noisy=latents_noisy,
@@ -361,6 +362,7 @@ class HunyuanVideoGuidance(BaseObject):
                 use_one_step=debug_one_step,
                 num_steps=debug_num_steps,
                 video_length=debug_video_length or T,
+                debug_pipe_steps=debug_pipe_steps,
             )
             if debug_panel:
                 self._debug_save_panel(
@@ -380,13 +382,15 @@ class HunyuanVideoGuidance(BaseObject):
                     grad=grad,
                     prompt_embeds=prompt_embeds,
                     prompt_mask=prompt_mask,
-                    prompt=prompt,
-                    negative_prompt=self.cfg.negative_prompt,
-                    debug_save_dir=debug_save_dir,
-                    debug_step=debug_step,
-                    pipe_frames=pipe_frames,
-                    sds_frames=sds_frames,
-                )
+                prompt=prompt,
+                negative_prompt=self.cfg.negative_prompt,
+                debug_save_dir=debug_save_dir,
+                debug_step=debug_step,
+                pipe_frames=pipe_frames,
+                sds_frames=sds_frames,
+                pipe_latents=pipe_latents,
+                sds_x0_est=sds_x0_est,
+            )
 
         return guidance_out
 
@@ -415,44 +419,96 @@ class HunyuanVideoGuidance(BaseObject):
         imageio.mimwrite(path, video_np, fps=fps)
 
     @staticmethod
-    def _tile_channels(img_cthw: Float[Tensor, "C T H W"], target_hw: int = 128) -> np.ndarray:
-        # expect torch tensor on any device
+    def _tile_channels(
+        img_cthw: Float[Tensor, "C T H W"], target_hw: int = 128
+    ) -> Tuple[np.ndarray, Optional[str]]:
+        """
+        Returns:
+          combined_img: concat [PCA(or RGB) , channel-grid] horizontally for first frame; frames in grid are concatenated horizontally.
+          pca_info: text describing PCA mapping (if C>3)
+        """
         C, T, H, W = img_cthw.shape
+
+        # ---- channel grid over all frames ----
         imgs = []
         for t in range(T):
             slice_c = img_cthw[:, t]  # C,H,W
             if C == 3:
                 arr = slice_c.permute(1, 2, 0).cpu().numpy()
             else:
-                # tile channels as 2x2 (or ceil) grid, resized to (H/2,W/2)
                 per = []
                 side = int(np.ceil(np.sqrt(C)))
-                h_small, w_small = max(1, H // 2), max(1, W // 2)
                 for c in range(C):
                     ch = slice_c[c].unsqueeze(0)  #1,H,W
                     ch_img = ch.expand(3, -1, -1)
-                    ch_img = F.interpolate(ch_img.unsqueeze(0), size=(h_small, w_small), mode="bilinear", align_corners=False)[0]
+                    ch_img = F.interpolate(
+                        ch_img.unsqueeze(0),
+                        size=(target_hw, target_hw),
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0]
                     per.append(ch_img)
-                # pad to full grid
                 while len(per) < side * side:
                     per.append(torch.zeros_like(per[0]))
                 rows = []
                 for r in range(side):
-                    row = torch.cat(per[r * side:(r + 1) * side], dim=2)
+                    row = torch.cat(per[r * side : (r + 1) * side], dim=2)
                     rows.append(row)
                 grid = torch.cat(rows, dim=1)
                 arr = grid.permute(1, 2, 0).cpu().numpy()
             arr = np.clip(arr, 0.0, 1.0)
-            # resize each frame to target_hw x target_hw
             arr = cv2.resize(arr, (target_hw, target_hw), interpolation=cv2.INTER_AREA)
             imgs.append(arr)
-        # concat frames horizontally
-        return np.concatenate(imgs, axis=1)
+        grid_img = np.concatenate(imgs, axis=1)  # H x (target_hw*T) x 3
+
+        # ---- PCA (or RGB) for first frame ----
+        if C == 3:
+            pca_rgb = imgs[0]  # first frame already resized
+            pca_info = None
+        else:
+            data = img_cthw[:, 0].permute(1, 2, 0).reshape(-1, C).detach().cpu().float()  # first frame
+            data = data - data.mean(dim=0, keepdim=True)
+            U, S, Vh = torch.linalg.svd(data, full_matrices=False)
+            comps = Vh[:3]  # (3,C)
+            proj = data @ comps.T  # (N,3)
+            proj -= proj.min(dim=0, keepdim=True)[0]
+            denom = proj.max(dim=0, keepdim=True)[0].clamp(min=1e-6)
+            proj = proj / denom
+            pca_img = proj.reshape(H, W, 3)
+            pca_img = cv2.resize(pca_img.numpy(), (target_hw, target_hw), interpolation=cv2.INTER_AREA)
+            pca_rgb = (np.clip(pca_img, 0.0, 1.0) * 255).astype(np.uint8)
+            # 记录每个 PC 的权重最大通道
+            pc_top = []
+            for i in range(3):
+                weights = comps[i]
+                topk = torch.topk(weights.abs(), k=min(3, C))
+                pc_top.append(
+                    "PC{} top: ".format(i + 1)
+                    + ", ".join([f"ch{idx.item()}:{weights[idx].item():.3f}" for idx in topk.indices])
+                )
+            pca_info = " | ".join(pc_top)
+
+        # ---- concat PCA/RGB and grid ----
+        h = max(pca_rgb.shape[0], grid_img.shape[0])
+        # pad heights if needed
+        def pad_h(img, target_h):
+            if img.shape[0] == target_h:
+                return img
+            pad = target_h - img.shape[0]
+            return np.pad(img, ((0, pad), (0, 0), (0, 0)), mode="constant", constant_values=255)
+
+        pca_rgb = pad_h(pca_rgb, h)
+        grid_img = pad_h(grid_img, h)
+        combined = np.concatenate([pca_rgb, grid_img], axis=1)
+
+        return combined, pca_info
 
     @staticmethod
     def _scalar_row(text: str, width: int = 400, height: int = 40) -> np.ndarray:
+        width = int(width * 1.5)
+        height = int(height * 2)
         canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
-        cv2.putText(canvas, text, (10, height // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(canvas, text, (10, height // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2, cv2.LINE_AA)
         return canvas
 
     @torch.no_grad()
@@ -480,6 +536,8 @@ class HunyuanVideoGuidance(BaseObject):
         debug_step: int,
         pipe_frames: Optional[Tensor],
         sds_frames: Optional[Tensor],
+        pipe_latents: Optional[Tensor],
+        sds_x0_est: Optional[Tensor],
     ) -> None:
         os.makedirs(debug_save_dir, exist_ok=True)
         rows = []
@@ -507,19 +565,23 @@ class HunyuanVideoGuidance(BaseObject):
                 shape_logs.append(f"{label}: shape={tuple(t_cpu.shape)} (skipped, ndim={t_cpu.ndim})")
                 return
             shape_logs.append(f"{label}: shape={tuple(cthw.shape)}")
-            row_img = self._tile_channels(cthw)
-            # ensure 3 channels
-            if row_img.shape[2] == 1:
-                row_img = np.repeat(row_img, 3, axis=2)
+            row_img, pca_info = self._tile_channels(cthw)
             rows.append((label, row_img))
+            if pca_info:
+                shape_logs.append(f"{label} PCA info: {pca_info}")
 
         # scalar/info rows
-        rows.append(("num_train_timesteps=len(scheduler.timesteps); min_step; max_step", self._scalar_row(f"num_train_timesteps={self.num_train_timesteps}, min_step={self.min_step}, max_step={self.max_step}")))
+        rows.append(("num_train_timesteps=len(scheduler.timesteps)", self._scalar_row(f"{self.num_train_timesteps}")))
+        rows.append(("min_step", self._scalar_row(f"{self.min_step}")))
+        rows.append(("max_step", self._scalar_row(f"{self.max_step}")))
         shape_logs.append(f"num_train_timesteps={self.num_train_timesteps}, min_step={self.min_step}, max_step={self.max_step}")
         sigma_val = sigma.detach().reshape(-1)[0].item()
-        rows.append(("t_int = randint(min_step, max_step); t = scheduler.timesteps[t_int]; sigma = scheduler.sigmas[t_int]", self._scalar_row(f"t_int={t_int.cpu().tolist()}, t={t.cpu().tolist()}, sigma={sigma_val:.6f}")))
+        rows.append(("t_int = randint(min_step, max_step)", self._scalar_row(f"{t_int.cpu().tolist()}")))
+        rows.append(("t = scheduler.timesteps[t_int]", self._scalar_row(f"{t.cpu().tolist()}")))
+        rows.append(("sigma = scheduler.sigmas[t_int]", self._scalar_row(f"{sigma_val:.6f}")))
         shape_logs.append(f"t_int={t_int.cpu().tolist()}, t={t.cpu().tolist()}, sigma={sigma_val:.6f}")
-        rows.append(("prompt", self._scalar_row(f"prompt={prompt} | negative={negative_prompt}", width=800)))
+        rows.append(("prompt", self._scalar_row(f"prompt={prompt}", width=800)))
+        rows.append(("negative_prompt", self._scalar_row(f"negative={negative_prompt}", width=800)))
         shape_logs.append(f"prompt len={len(prompt)}, negative len={len(negative_prompt)}")
 
         add_tensor_row("rgb", rgb)
@@ -534,15 +596,18 @@ class HunyuanVideoGuidance(BaseObject):
         shape_logs.append(cond_desc)
         add_tensor_row("cond_latents", cond_latents)
         add_tensor_row("latents_concat", latents_concat)
+        if sds_x0_est is not None:
+            rows.append(("sds_x0_est stats", self._scalar_row(f"shape={tuple(sds_x0_est.shape)}, min={sds_x0_est.min().item():.4f}, max={sds_x0_est.max().item():.4f}, norm={sds_x0_est.norm().item():.4f}")))
+        add_tensor_row("x0_est = (latents_noisy - sigma*noise)/(1-sigma)", sds_x0_est.unsqueeze(0) if sds_x0_est is not None else None)  # add batch dim back
 
         # Transformer inputs/outputs
         add_tensor_row("noise_pred (transformer output)", noise_pred)
 
         # SDS weights / grads (scalar)
         w_val = float((sigma**2).detach().reshape(-1)[0].item())
-        rows.append(("w = sigma**2", self._scalar_row(f"w={w_val:.6f}")))
+        rows.append(("w = sigma**2", self._scalar_row(f"{w_val:.6f}")))
         grad_sample = grad[0].detach()
-        rows.append(("grad = w*(noise_pred-noise) (norm)", self._scalar_row(f"grad_norm={grad_sample.norm().item():.4f}")))
+        rows.append(("grad = w*(noise_pred-noise) (norm)", self._scalar_row(f"{grad_sample.norm().item():.4f}")))
 
         if prompt_embeds is not None:
             rows.append(("prompt_embeds", self._scalar_row(f"shape={tuple(prompt_embeds.shape)}, norm={prompt_embeds.norm().item():.3f}")))
@@ -575,6 +640,7 @@ class HunyuanVideoGuidance(BaseObject):
 
         add_video_row("pipe video", pipe_frames)
         add_video_row("sds1step video", sds_frames)
+        add_tensor_row("pipe_latents (decoder input from pipe)", pipe_latents.unsqueeze(0) if pipe_latents is not None else None)
 
         panel_imgs = []
         label_w = 1100  # expanded label column width for readability
@@ -616,7 +682,9 @@ class HunyuanVideoGuidance(BaseObject):
         use_one_step: bool,
         num_steps: int,
         video_length: int,
-    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+        debug_pipe_steps: int = 1,
+        **kwargs,
+    ) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
         os.makedirs(debug_save_dir, exist_ok=True)
         aspect = f"{rgb.shape[-1]}:{rgb.shape[-2]}"
 
@@ -638,6 +706,7 @@ class HunyuanVideoGuidance(BaseObject):
 
         # Full pipeline generation (multi-step denoise)
         pipe_frames = None
+        pipe_latents = None
         if use_pipe:
             ref_image = None
             if mask_type == "i2v":
@@ -647,16 +716,22 @@ class HunyuanVideoGuidance(BaseObject):
                 out = self.pipe(
                     prompt=prompt,
                     aspect_ratio=aspect,
-                    num_inference_steps=num_steps,
+                    num_inference_steps=debug_pipe_steps,
                     video_length=video_length,
                     negative_prompt=self.cfg.negative_prompt,
                     seed=0,
                     enable_sr=False,
                     prompt_rewrite=False,
-                    output_type="pt",
+                    output_type="latent",
                     reference_image=ref_image,
                 )
-                video_pipe = out.videos[0]  # (C,T,H,W)
+                # out is latent tensor
+                latents_pipe = out if isinstance(out, torch.Tensor) else out[0]
+                if latents_pipe.dim() == 4:
+                    latents_pipe = latents_pipe.unsqueeze(2)
+                pipe_latents = latents_pipe[0].detach().cpu()
+                video_pipe = self._decode_latents(latents_pipe)[0]  # (C,T,H,W)
+                video_pipe = _upsample_to_bucket(video_pipe)
                 pipe_path = os.path.join(debug_save_dir, f"it{debug_step}-pipe.mp4")
                 self._save_video_tensor(video_pipe, pipe_path)
                 pipe_frames = video_pipe.cpu()
@@ -665,6 +740,7 @@ class HunyuanVideoGuidance(BaseObject):
 
         # Single-step latent -> decode preview (SDS path)
         sds_frames = None
+        sds_x0_est = None
         if use_one_step:
             try:
                 # reconstruct clean latents with known noise and schedule
@@ -678,11 +754,12 @@ class HunyuanVideoGuidance(BaseObject):
                 one_step_path = os.path.join(debug_save_dir, f"it{debug_step}-sds1step.mp4")
                 self._save_video_tensor(video_1step, one_step_path)
                 sds_frames = video_1step.cpu()
+                sds_x0_est = x0_est.detach().cpu()
             except Exception as e:
                 threestudio.warn(f"Debug one-step decode failed: {e}")
 
-        # return frames for panel use
-        return pipe_frames, sds_frames
+        # return frames/latents for panel use
+        return pipe_frames, sds_frames, pipe_latents, sds_x0_est
 
     def destroy(self) -> None:
         cleanup()
