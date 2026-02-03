@@ -6,6 +6,7 @@ from . import (
     stable_diffusion_sdi_guidance,
     stable_diffusion_unified_guidance,
     stable_diffusion_vsd_guidance,
+    stable_diffusion_guidance_vis,
     stable_zero123_guidance,
     hunyuanvideo_guidance,
     zero123_guidance,

@@ -1,4 +1,4 @@
-name: "dreamfusion-hunyuanvideo"
+name: "dreamfusion-sd-vs-hunyuan"
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
 exp_root_dir: "outputs"
 seed: 0
@@ -15,14 +15,14 @@ data:
   eval_camera_distance: 2.0
   eval_fovy_deg: 70.
 
-system_type: "dreamfusion-hunyuanvideo-system"
+system_type: "dreamfusion-sd-vs-hunyuan-system"
 system:
-  n_arc_views: 1   # number of views along the camera arc
-  arc_span_deg: 0. # total span degrees
+  n_arc_views: 1
+  arc_span_deg: 0.
   fix_elevation: false
   arc_direction: "cw"
   debug_video_interval: 100
-  debug_video_num_steps: 50
+  debug_video_num_steps: 1
   debug_video_length: null
   debug_video_use_pipe: true
   debug_video_use_one_step: true
@@ -30,30 +30,18 @@ system:
   geometry:
     radius: 2.0
     normal_type: "analytic"
-
-    # the density initialization proposed in the DreamFusion paper
-    # does not work very well
-    # density_bias: "blob_dreamfusion"
-    # density_activation: exp
-    # density_blob_scale: 5.
-    # density_blob_std: 0.2
-
-    # use Magic3D density initialization instead
     density_bias: "blob_magic3d"
     density_activation: softplus
     density_blob_scale: 10.
     density_blob_std: 0.5
-
-    # coarse to fine hash grid encoding
-    # to ensure smooth analytic normals
     pos_encoding_config:
       otype: ProgressiveBandHashGrid
       n_levels: 16
       n_features_per_level: 2
       log2_hashmap_size: 19
       base_resolution: 16
-      per_level_scale: 1.447269237440378 # max resolution 4096
-      start_level: 8 # resolution ~200
+      per_level_scale: 1.447269237440378
+      start_level: 8
       start_step: 2000
       update_steps: 500
 
@@ -73,9 +61,22 @@ system:
 
   prompt_processor_type: "hunyuanvideo-prompt-processor"
   prompt_processor:
-    prompt: ???
+    prompt: "A cinematic video of a hamburger..."
     view_dependent_prompting: true
 
+  # SD guidance (used for training)
+  sd_guidance_type: "stable-diffusion-guidance-vis"
+  sd_guidance:
+    pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+    guidance_scale: 100.0
+    min_step_percent: 0.02
+    max_step_percent: 0.98
+    weighting_strategy: "sds"
+    debug_save_dir: null
+    debug_step: null
+    debug_panel: true
+
+  # Hunyuan guidance (for comparison only)
   guidance_type: "hunyuanvideo-guidance"
   guidance:
     pretrained_model_name_or_path: "HunyuanVideo-1.5/ckpts"
@@ -88,6 +89,10 @@ system:
     weighting_strategy: sds
     min_step_percent: 0.02
     max_step_percent: 0.98
+    debug_save_dir: null
+    debug_step: null
+    debug_panel: true
+    # panel files will end with _hunyuan internally
 
   loggers:
     wandb:
@@ -117,24 +122,11 @@ trainer:
   max_steps: 10000
   log_every_n_steps: 1
   num_sanity_val_steps: 0
-  val_check_interval: 100
+  val_check_interval: 1
   enable_progress_bar: true
   precision: 16-mixed
 
 checkpoint:
-  save_last: true # save at each validation time
+  save_last: true
   save_top_k: -1
   every_n_train_steps: ${trainer.max_steps}
-
-
-# echo $TMPDIR
-# mv HunyuanVideo-1.5/ckpts HunyuanVideo-1.5/ckpts.homefs
-# TARGET=${TMPDIR:-/tmp}/HunyuanVideo-1.5/ckpts
-# mkdir -p "$TARGET"
-# rsync -a HunyuanVideo-1.5/ckpts.homefs/ "$TARGET"/
-# ln -s "$TARGET" HunyuanVideo-1.5/ckpts
-# ls HunyuanVideo-1.5/ckpts
-
-# python launch.py --config configs/dreamfusion-hunyuanvideo.yaml --train --gpu 0 system.prompt_processor.prompt="A cinematic video of a hamburger. The vertical camera angle is fixed at 0 degrees (eye-level), while the horizontal camera rotates clockwise a full 360 degrees around the hamburger. The hamburger remains centered in the frame throughout the rotation, with smooth, continuous motion and high visual detail."
-
-# python launch.py   --config configs/dreamfusion-hunyuanvideo.yaml   --train --gpu 0   system.weights=outputs/dreamfusion-sd/a_delicious_hamburger/ckpts/last.ckpt   system.prompt_processor.prompt="A cinematic video of a hamburger. The vertical camera angle is fixed at 0 degrees (eye-level), while the horizontal camera rotates clockwise a full 360 degrees around the hamburger. The hamburger remains centered in the frame throughout the rotation, with smooth, continuous motion and high visual detail."

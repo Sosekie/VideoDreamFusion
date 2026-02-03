@@ -660,7 +660,8 @@ class HunyuanVideoGuidance(BaseObject):
                     im = np.pad(im, ((0, 0), (0, pad_w), (0, 0)), mode="constant", constant_values=255)
                 padded.append(im)
             panel = np.concatenate(padded, axis=0)
-        save_path = os.path.join(debug_save_dir, f"it{debug_step}-panel.png")
+        suffix = "_hunyuan"
+        save_path = os.path.join(debug_save_dir, f"it{debug_step}-panel{suffix}.png")
         imageio.imwrite(save_path, panel)
         # log shapes to stdout
         for ln in shape_logs:
@@ -732,7 +733,7 @@ class HunyuanVideoGuidance(BaseObject):
                 pipe_latents = latents_pipe[0].detach().cpu()
                 video_pipe = self._decode_latents(latents_pipe)[0]  # (C,T,H,W)
                 video_pipe = _upsample_to_bucket(video_pipe)
-                pipe_path = os.path.join(debug_save_dir, f"it{debug_step}-pipe.mp4")
+                pipe_path = os.path.join(debug_save_dir, f"it{debug_step}-pipe_hunyuan.mp4")
                 self._save_video_tensor(video_pipe, pipe_path)
                 pipe_frames = video_pipe.cpu()
             except Exception as e:
@@ -751,7 +752,7 @@ class HunyuanVideoGuidance(BaseObject):
                 x0_est = (latents_noisy - sigma_val * noise) / denom
                 video_1step = self._decode_latents(x0_est)[0]  # (C,T,H,W)
                 video_1step = _upsample_to_bucket(video_1step)
-                one_step_path = os.path.join(debug_save_dir, f"it{debug_step}-sds1step.mp4")
+                one_step_path = os.path.join(debug_save_dir, f"it{debug_step}-sds1step_hunyuan.mp4")
                 self._save_video_tensor(video_1step, one_step_path)
                 sds_frames = video_1step.cpu()
                 sds_x0_est = x0_est.detach().cpu()
