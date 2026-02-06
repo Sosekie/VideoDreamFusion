@@ -1,0 +1,1 @@
+rsync -avz   --exclude='.git'   --exclude='__pycache__'   --exclude='.gitignore'    --exclude='.tmp_flash_attn'   --exclude='.threestudio_cache'   cf23h027@submit02.unibe.ch:/storage/homefs/cf23h027/VideoDreamFusion/ ./

@@ -1,4 +1,8 @@
-name: "dreamfusion-sd"
+# Debug config: Uses SD guidance-vis WITHOUT HunyuanVideo
+# This helps isolate whether the problem is in the visualization guidance code
+# Compare this with dreamfusion-sd.yaml which uses plain stable-diffusion-guidance
+
+name: "dreamfusion-sd-debug"
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
 exp_root_dir: "outputs"
 seed: 0
@@ -15,36 +19,25 @@ data:
   eval_camera_distance: 2.0
   eval_fovy_deg: 70.
 
-system_type: "dreamfusion-system"
+# Use the debug system that's identical to dreamfusion.py
+system_type: "dreamfusion-sd-only-debug-system"
 system:
   geometry_type: "implicit-volume"
   geometry:
     radius: 2.0
     normal_type: "analytic"
-
-    # the density initialization proposed in the DreamFusion paper
-    # does not work very well
-    # density_bias: "blob_dreamfusion"
-    # density_activation: exp
-    # density_blob_scale: 5.
-    # density_blob_std: 0.2
-
-    # use Magic3D density initialization instead
     density_bias: "blob_magic3d"
     density_activation: softplus
     density_blob_scale: 10.
     density_blob_std: 0.5
-
-    # coarse to fine hash grid encoding
-    # to ensure smooth analytic normals
     pos_encoding_config:
       otype: ProgressiveBandHashGrid
       n_levels: 16
       n_features_per_level: 2
       log2_hashmap_size: 19
       base_resolution: 16
-      per_level_scale: 1.447269237440378 # max resolution 4096
-      start_level: 8 # resolution ~200
+      per_level_scale: 1.447269237440378
+      start_level: 8
       start_step: 2000
       update_steps: 500
 
@@ -67,13 +60,17 @@ system:
     pretrained_model_name_or_path: "Manojb/stable-diffusion-2-1-base"
     prompt: ???
 
-  guidance_type: "stable-diffusion-guidance"
+  # Use the VIS version of SD guidance to test it
+  guidance_type: "stable-diffusion-guidance-vis"
   guidance:
     pretrained_model_name_or_path: "Manojb/stable-diffusion-2-1-base"
     guidance_scale: 100.
     weighting_strategy: sds
     min_step_percent: 0.02
     max_step_percent: 0.98
+    debug_save_dir: null
+    debug_step: null
+    debug_panel: true
 
   loggers:
     wandb:
@@ -108,10 +105,9 @@ trainer:
   precision: 16-mixed
 
 checkpoint:
-  save_last: true # save at each validation time
+  save_last: true
   save_top_k: -1
   every_n_train_steps: ${trainer.max_steps}
 
-
-# Run command example:
-# python launch.py --config configs/dreamfusion-sd.yaml --train --gpu 0 system.prompt_processor.prompt="a zoomed out DSLR photo of a baby bunny sitting on top of a stack of pancakes"
+# Run command:
+# python launch.py --config configs/dreamfusion-sd-debug.yaml --train --gpu 0 system.prompt_processor.prompt="a zoomed out DSLR photo of a baby bunny sitting on top of a stack of pancakes"

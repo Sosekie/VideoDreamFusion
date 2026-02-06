@@ -135,6 +135,15 @@ checkpoint:
 # ln -s "$TARGET" HunyuanVideo-1.5/ckpts
 # ls HunyuanVideo-1.5/ckpts
 
+
 # python launch.py --config configs/dreamfusion-hunyuanvideo.yaml --train --gpu 0 system.prompt_processor.prompt="A cinematic video of a hamburger. The vertical camera angle is fixed at 0 degrees (eye-level), while the horizontal camera rotates clockwise a full 360 degrees around the hamburger. The hamburger remains centered in the frame throughout the rotation, with smooth, continuous motion and high visual detail."
 
+# weights from stable-diffusion run
 # python launch.py   --config configs/dreamfusion-hunyuanvideo.yaml   --train --gpu 0   system.weights=outputs/dreamfusion-sd/a_delicious_hamburger/ckpts/last.ckpt   system.prompt_processor.prompt="A cinematic video of a hamburger. The vertical camera angle is fixed at 0 degrees (eye-level), while the horizontal camera rotates clockwise a full 360 degrees around the hamburger. The hamburger remains centered in the frame throughout the rotation, with smooth, continuous motion and high visual detail."
+
+# dreamfusion_sd_vs_hunyuan
+# python launch.py \
+#   --config configs/dreamfusion-sd-vs-hunyuan.yaml \
+#   --train --gpu 0 \
+#   system.weights=outputs/dreamfusion-sd/a_delicious_hamburger/ckpts/last.ckpt \
+#   system.prompt_processor.prompt="A cinematic video of a hamburger. The vertical camera angle is fixed at 0 degrees (eye-level), while the horizontal camera rotates clockwise a full 360 degrees around the hamburger. The hamburger remains centered in the frame throughout the rotation, with smooth, continuous motion and high visual detail."

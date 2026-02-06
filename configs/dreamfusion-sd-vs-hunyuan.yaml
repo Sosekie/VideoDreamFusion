@@ -1,13 +1,13 @@
 name: "dreamfusion-sd-vs-hunyuan"
-tag: "${rmspace:${system.prompt_processor.prompt},_}"
+tag: ""
 exp_root_dir: "outputs"
 seed: 0
 
 data_type: "random-camera-datamodule"
 data:
   batch_size: 1
-  width: 128
-  height: 128
+  width: 64
+  height: 64
   camera_distance_range: [1.5, 2.0]
   fovy_range: [40, 70]
   elevation_range: [-10, 45]
@@ -21,7 +21,7 @@ system:
   arc_span_deg: 0.
   fix_elevation: false
   arc_direction: "cw"
-  debug_video_interval: 100
+  debug_video_interval: 50
   debug_video_num_steps: 1
   debug_video_length: null
   debug_video_use_pipe: true
@@ -64,10 +64,16 @@ system:
     prompt: "A cinematic video of a hamburger..."
     view_dependent_prompting: true
 
-  # SD guidance (used for training)
+  # SD guidance (used for training) - use same model as dreamfusion-sd.yaml
+  sd_prompt_processor_type: "stable-diffusion-prompt-processor"
+  sd_prompt_processor:
+    pretrained_model_name_or_path: "Manojb/stable-diffusion-2-1-base"
+    prompt: ${system.prompt_processor.prompt}
+    negative_prompt: ""
+    view_dependent_prompting: true
   sd_guidance_type: "stable-diffusion-guidance-vis"
   sd_guidance:
-    pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+    pretrained_model_name_or_path: "Manojb/stable-diffusion-2-1-base"
     guidance_scale: 100.0
     min_step_percent: 0.02
     max_step_percent: 0.98
@@ -75,6 +81,8 @@ system:
     debug_save_dir: null
     debug_step: null
     debug_panel: true
+  sd_render_resolution: [64, 64]
+  sd_guidance_requires_grad: false
 
   # Hunyuan guidance (for comparison only)
   guidance_type: "hunyuanvideo-guidance"
@@ -93,6 +101,8 @@ system:
     debug_step: null
     debug_panel: true
     # panel files will end with _hunyuan internally
+  hy_render_resolution: [256, 256]
+  hy_guidance_requires_grad: true
 
   loggers:
     wandb:
@@ -122,7 +132,7 @@ trainer:
   max_steps: 10000
   log_every_n_steps: 1
   num_sanity_val_steps: 0
-  val_check_interval: 1
+  val_check_interval: 50
   enable_progress_bar: true
   precision: 16-mixed
 
@@ -130,3 +140,28 @@ checkpoint:
   save_last: true
   save_top_k: -1
   every_n_train_steps: ${trainer.max_steps}
+
+# Run command example:
+# python launch.py \
+#   --config configs/dreamfusion-sd-vs-hunyuan.yaml \
+#   --train --gpu 0 \
+#   system.prompt_processor.prompt="a zoomed out DSLR photo of a baby bunny sitting on top of a stack of pancakes"
+
+
+# # SD-only（SD 训练，Hunyuan仅可视化）
+# python launch.py \
+#   --config configs/exp_sd-only.yaml \
+#   --train --gpu 0 \
+#   system.prompt_processor.prompt="a zoomed out DSLR photo of a baby bunny sitting on top of a stack of pancakes"
+
+# # Hunyuan-only（Hunyuan 训练，SD仅可视化）
+# python launch.py \
+#   --config configs/exp_hy-only.yaml \
+#   --train --gpu 0 \
+#   system.prompt_processor.prompt="a zoomed out DSLR photo of a baby bunny sitting on top of a stack of pancakes"
+
+# # SD + Hunyuan 同时训练
+# python launch.py \
+#   --config configs/exp_sd+hy.yaml \
+#   --train --gpu 0 \
+#   system.prompt_processor.prompt="a zoomed out DSLR photo of a baby bunny sitting on top of a stack of pancakes"

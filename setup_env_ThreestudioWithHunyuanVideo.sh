@@ -76,3 +76,40 @@ if torch.cuda.is_available():
     print("GPU Capability:", torch.cuda.get_device_capability(0))
 print("==========================================")
 PY
+
+
+# === 复制 HunyuanVideo checkpoints 到本地 scratch 以加速加载 ===
+CKPTS_LINK="HunyuanVideo-1.5/ckpts"
+CKPTS_BACKUP="HunyuanVideo-1.5/ckpts.homefs"
+TARGET="${TMPDIR:-/tmp}/HunyuanVideo-1.5/ckpts"
+
+# 检查符号链接是否存在且有效（目标目录可访问）
+if [ -L "$CKPTS_LINK" ] && [ -d "$CKPTS_LINK" ]; then
+    echo "[ckpts] 符号链接有效，跳过复制: $(readlink "$CKPTS_LINK")"
+else
+    echo "[ckpts] 需要重新设置..."
+    
+    # 确保备份目录存在
+    if [ -d "$CKPTS_LINK" ] && [ ! -L "$CKPTS_LINK" ]; then
+        # 原始目录存在（不是符号链接），移动为备份
+        mv "$CKPTS_LINK" "$CKPTS_BACKUP"
+        echo "[ckpts] 已备份原目录到 $CKPTS_BACKUP"
+    fi
+    
+    # 删除无效的符号链接
+    [ -L "$CKPTS_LINK" ] && rm -f "$CKPTS_LINK"
+    
+    # 删除备份目录内可能存在的错误符号链接
+    [ -L "$CKPTS_BACKUP/ckpts" ] && rm -f "$CKPTS_BACKUP/ckpts"
+    
+    # 复制到 scratch
+    echo "[ckpts] 复制到 $TARGET ..."
+    mkdir -p "$TARGET"
+    rsync -a "$CKPTS_BACKUP/" "$TARGET"/
+    
+    # 创建符号链接
+    ln -s "$TARGET" "$CKPTS_LINK"
+    echo "[ckpts] 完成！"
+fi
+
+ls "$CKPTS_LINK"

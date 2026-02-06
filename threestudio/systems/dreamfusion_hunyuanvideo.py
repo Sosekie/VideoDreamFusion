@@ -27,6 +27,7 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
         arc_span_deg: float = 360.0
         arc_direction: str = "cw"  # "cw" or "ccw"
         fix_elevation: bool = False
+        arc_resample_interval: int = 1  # Resample camera every N steps (1=every iter, 0=never)
         debug_video_interval: int = 0  # 0 to disable; otherwise save every k steps
         debug_video_num_steps: int = 12
         debug_video_length: Optional[int] = None
@@ -40,6 +41,8 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
         super().configure()
         self._arc_epoch: int = -1
         self._arc_start_azimuth_deg: Optional[float] = None
+        self._arc_start_elevation_deg: Optional[float] = None
+        self._arc_camera_distance: Optional[float] = None
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         render_out = self.renderer(**batch)
@@ -73,11 +76,22 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
         arc_span_deg = self.cfg.arc_span_deg
         signed_span = -abs(arc_span_deg) if self.cfg.arc_direction.lower() == "cw" else abs(arc_span_deg)
 
-        new_epoch = False
-        if self._arc_epoch != self.true_current_epoch or self._arc_start_azimuth_deg is None:
-            self._arc_epoch = self.true_current_epoch
+        # Determine when to resample camera azimuth/elevation:
+        # - arc_resample_interval: number of steps between resampling (default=1, every iteration)
+        # - If 0 or negative: never resample after initial sample
+        resample_interval = getattr(self.cfg, "arc_resample_interval", 1)
+        
+        should_resample = False
+        if self._arc_start_azimuth_deg is None:
+            # First call, always sample
+            should_resample = True
+        elif resample_interval > 0 and self.true_global_step % resample_interval == 0:
+            # Resample at regular intervals
+            should_resample = True
+
+        if should_resample:
             self._arc_start_azimuth_deg = float(torch.rand(1).item() * 360.0)
-            new_epoch = True
+            self._arc_start_elevation_deg = None  # Will be sampled below
 
         cam_cfg = self._camera_cfg()
         cam_dist_range = (
@@ -123,19 +137,21 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
         if getattr(self.cfg, "fix_elevation", False):
             elevation_deg = torch.zeros(num_views, device=device)
         else:
-            elevation_deg = (
-                torch.zeros(num_views, device=device).uniform_(
-                    float(elev_range[0]), float(elev_range[1])
+            # Sample elevation only when should_resample, otherwise reuse cached value
+            if should_resample or self._arc_start_elevation_deg is None:
+                self._arc_start_elevation_deg = float(
+                    torch.zeros(1).uniform_(float(elev_range[0]), float(elev_range[1])).item()
                 )
-            )
+            elevation_deg = torch.full((num_views,), self._arc_start_elevation_deg, device=device)
         elevation = elevation_deg * math.pi / 180.0
         azimuth = azimuth_deg * math.pi / 180.0
 
-        camera_distance = (
-            torch.rand(1, device=device)
-            * (cam_dist_range[1] - cam_dist_range[0])
-            + cam_dist_range[0]
-        )
+        # Sample camera distance only when should_resample, otherwise reuse cached value
+        if should_resample or self._arc_camera_distance is None:
+            self._arc_camera_distance = float(
+                torch.rand(1).item() * (cam_dist_range[1] - cam_dist_range[0]) + cam_dist_range[0]
+            )
+        camera_distance = torch.tensor([self._arc_camera_distance], device=device)
         camera_distances = camera_distance.expand(num_views)
         camera_positions = torch.stack(
             [
@@ -225,9 +241,9 @@ class DreamFusionHunyuanVideo(BaseLift3DSystem):
         ).to(device)
         mvp_mtx = get_mvp_matrix(c2w, proj_mtx)
 
-        if new_epoch:
+        if should_resample:
             threestudio.info(
-                f"Arc views epoch {self._arc_epoch}: "
+                f"Arc views step {self.true_global_step}: "
                 f"azimuth_deg={azimuth_deg.detach().cpu().tolist()}, "
                 f"elevation_deg={elevation_deg.detach().cpu().tolist()}, "
                 f"camera_distance={camera_distance.item():.3f}"

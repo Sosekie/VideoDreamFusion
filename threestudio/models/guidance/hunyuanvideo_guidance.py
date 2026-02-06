@@ -38,6 +38,15 @@ class HunyuanVideoGuidance(BaseObject):
         half_precision_weights: bool = True
         negative_prompt: str = ""
         use_vision_encoder: bool = False
+        # debug options (parsing only; runtime uses __call__ args)
+        debug_save_dir: Optional[str] = None
+        debug_step: Optional[int] = None
+        debug_panel: bool = True
+        debug_pipe: bool = True
+        debug_one_step: bool = True
+        debug_num_steps: int = 12
+        debug_video_length: Optional[int] = None
+        debug_pipe_steps: int = 1
 
     cfg: Config
 
@@ -435,11 +444,20 @@ class HunyuanVideoGuidance(BaseObject):
             slice_c = img_cthw[:, t]  # C,H,W
             if C == 3:
                 arr = slice_c.permute(1, 2, 0).cpu().numpy()
+                # Normalize to [0, 1] for better visualization (same as SD)
+                arr_min, arr_max = arr.min(), arr.max()
+                if arr_max - arr_min > 1e-6:
+                    arr = (arr - arr_min) / (arr_max - arr_min)
+                arr = np.clip(arr, 0.0, 1.0)
             else:
                 per = []
                 side = int(np.ceil(np.sqrt(C)))
                 for c in range(C):
                     ch = slice_c[c].unsqueeze(0)  #1,H,W
+                    # Normalize each channel individually
+                    ch_min, ch_max = ch.min(), ch.max()
+                    if ch_max - ch_min > 1e-6:
+                        ch = (ch - ch_min) / (ch_max - ch_min)
                     ch_img = ch.expand(3, -1, -1)
                     ch_img = F.interpolate(
                         ch_img.unsqueeze(0),
@@ -456,7 +474,7 @@ class HunyuanVideoGuidance(BaseObject):
                     rows.append(row)
                 grid = torch.cat(rows, dim=1)
                 arr = grid.permute(1, 2, 0).cpu().numpy()
-            arr = np.clip(arr, 0.0, 1.0)
+                arr = np.clip(arr, 0.0, 1.0)
             arr = cv2.resize(arr, (target_hw, target_hw), interpolation=cv2.INTER_AREA)
             imgs.append(arr)
         grid_img = np.concatenate(imgs, axis=1)  # H x (target_hw*T) x 3
@@ -548,7 +566,10 @@ class HunyuanVideoGuidance(BaseObject):
             if tensor is None:
                 shape_logs.append(f"{label}: None")
                 return
-            t_cpu = tensor[0].detach().float()
+            t_cpu = tensor.detach().float()
+            # Squeeze leading singleton batch dims
+            while t_cpu.ndim > 4 and t_cpu.shape[0] == 1:
+                t_cpu = t_cpu.squeeze(0)
             if t_cpu.ndim == 4:  # C,T,H,W expected
                 cthw = t_cpu
             elif t_cpu.ndim >= 5:
@@ -566,58 +587,159 @@ class HunyuanVideoGuidance(BaseObject):
                 return
             shape_logs.append(f"{label}: shape={tuple(cthw.shape)}")
             row_img, pca_info = self._tile_channels(cthw)
-            rows.append((label, row_img))
+            rows.append((label, row_img, f"shape={tuple(cthw.shape)}"))
             if pca_info:
                 shape_logs.append(f"{label} PCA info: {pca_info}")
 
+        # Helper visualization functions (defined early so they can be used in grad diagnostics)
+        def _make_hist_image(arr: np.ndarray, bins: int = 30, width: int = 420, height: int = 160, title: str = "") -> np.ndarray:
+            hist, bin_edges = np.histogram(arr, bins=bins)
+            hist = hist.astype(np.float32)
+            hist /= hist.max() + 1e-6
+            img = np.ones((height, width, 3), dtype=np.uint8) * 255
+            for i in range(bins):
+                x0 = int(i * width / bins)
+                x1 = int((i + 1) * width / bins)
+                y1 = height - 10
+                y0 = int((1.0 - hist[i]) * (height - 20)) + 10
+                cv2.rectangle(img, (x0, y0), (x1, y1), (60, 120, 200), -1)
+            if title:
+                cv2.putText(img, title, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 180), 1, cv2.LINE_AA)
+            xmin, xmax = bin_edges[0], bin_edges[-1]
+            cv2.putText(img, f"{xmin:.2e}", (10, height - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+            txt = f"{xmax:.2e}"
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            cv2.putText(img, txt, (width - tw - 5, height - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+            return img
+
+        def _make_heatmap_2d(arr_2d: np.ndarray, target: int = 128, label: str = "") -> np.ndarray:
+            arr = arr_2d - arr_2d.min()
+            arr = arr / (arr.max() + 1e-6)
+            arr = cv2.resize(arr, (target, target), interpolation=cv2.INTER_AREA)
+            cmap = cv2.applyColorMap((arr * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            img = cv2.cvtColor(cmap, cv2.COLOR_BGR2RGB)
+            if label:
+                cv2.putText(img, label, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+            return img
+
+        def _make_line_chart(values: list, width: int = 420, height: int = 160, title: str = "") -> np.ndarray:
+            img = np.ones((height, width, 3), dtype=np.uint8) * 255
+            if len(values) < 2:
+                cv2.putText(img, "not enough points", (10, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+                return img
+            vals = np.array(values, dtype=np.float32)
+            vmax = vals.max() + 1e-8
+            vmin = vals.min()
+            span = vmax - vmin + 1e-8
+            pts = []
+            for i, v in enumerate(vals):
+                x = int(i / (len(vals) - 1) * (width - 20)) + 10
+                y = int((1.0 - (v - vmin) / span) * (height - 30)) + 15
+                pts.append((x, y))
+            for i in range(1, len(pts)):
+                cv2.line(img, pts[i - 1], pts[i], (0, 100, 200), 2)
+            cv2.putText(img, title, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 180), 1, cv2.LINE_AA)
+            cv2.putText(img, f"min={vmin:.2e}", (10, height - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+            txt = f"max={vmax:.2e}"
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            cv2.putText(img, txt, (width - tw - 5, height - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+            return img
+
         # scalar/info rows
-        rows.append(("num_train_timesteps=len(scheduler.timesteps)", self._scalar_row(f"{self.num_train_timesteps}")))
-        rows.append(("min_step", self._scalar_row(f"{self.min_step}")))
-        rows.append(("max_step", self._scalar_row(f"{self.max_step}")))
+        rows.append(("num_train_timesteps=len(scheduler.timesteps)", self._scalar_row(f"{self.num_train_timesteps}"), ""))
+        rows.append(("min_step", self._scalar_row(f"{self.min_step}"), ""))
+        rows.append(("max_step", self._scalar_row(f"{self.max_step}"), ""))
         shape_logs.append(f"num_train_timesteps={self.num_train_timesteps}, min_step={self.min_step}, max_step={self.max_step}")
         sigma_val = sigma.detach().reshape(-1)[0].item()
-        rows.append(("t_int = randint(min_step, max_step)", self._scalar_row(f"{t_int.cpu().tolist()}")))
-        rows.append(("t = scheduler.timesteps[t_int]", self._scalar_row(f"{t.cpu().tolist()}")))
-        rows.append(("sigma = scheduler.sigmas[t_int]", self._scalar_row(f"{sigma_val:.6f}")))
+        rows.append(("t_int = randint(min_step, max_step)", self._scalar_row(f"{t_int.cpu().tolist()}"), ""))
+        rows.append(("t = scheduler.timesteps[t_int]", self._scalar_row(f"{t.cpu().tolist()}"), ""))
+        rows.append(("sigma = scheduler.sigmas[t_int]", self._scalar_row(f"{sigma_val:.6f}"), ""))
         shape_logs.append(f"t_int={t_int.cpu().tolist()}, t={t.cpu().tolist()}, sigma={sigma_val:.6f}")
-        rows.append(("prompt", self._scalar_row(f"prompt={prompt}", width=800)))
-        rows.append(("negative_prompt", self._scalar_row(f"negative={negative_prompt}", width=800)))
+        rows.append(("prompt = text", self._scalar_row(f"prompt={prompt}", width=800), ""))
+        rows.append(("negative_prompt = text", self._scalar_row(f"negative={negative_prompt}", width=800), ""))
+        rows.append(("--- INPUT / ENCODE ---", self._scalar_row("RGB -> VAE latents"), ""))
         shape_logs.append(f"prompt len={len(prompt)}, negative len={len(negative_prompt)}")
 
         add_tensor_row("rgb", rgb)
         add_tensor_row("rgb_norm = rgb.clamp(0,1)", rgb_norm)
         add_tensor_row("video_in = (rgb_norm*2-1).to(weights_dtype)", video_in)
         add_tensor_row("posterior = vae.encode(video_in)", posterior.latent_dist.mean)
-        add_tensor_row("latents = posterior.latent_dist.sample() * vae.config.scaling_factor", latents)
+        add_tensor_row("latents = posterior.sample()*vae.config.scaling_factor", latents)
         add_tensor_row("noise = randn_like(latents)", noise)
         add_tensor_row("latents_noisy = latents + sigma*noise", latents_noisy)
-        cond_desc = "cond_latents (t2v: zeros+mask | i2v: encode rgb[0] + mask)"
-        rows.append((cond_desc, self._scalar_row(cond_desc)))
+        rows.append(("--- COND & CONCAT ---", self._scalar_row("Condition / concat latents"), ""))
+        cond_desc = "cond_latents = (t2v: zeros+mask | i2v: encode rgb[0] + mask)"
+        rows.append((cond_desc, self._scalar_row(cond_desc), ""))
         shape_logs.append(cond_desc)
-        add_tensor_row("cond_latents", cond_latents)
-        add_tensor_row("latents_concat", latents_concat)
-        if sds_x0_est is not None:
-            rows.append(("sds_x0_est stats", self._scalar_row(f"shape={tuple(sds_x0_est.shape)}, min={sds_x0_est.min().item():.4f}, max={sds_x0_est.max().item():.4f}, norm={sds_x0_est.norm().item():.4f}")))
-        add_tensor_row("x0_est = (latents_noisy - sigma*noise)/(1-sigma)", sds_x0_est.unsqueeze(0) if sds_x0_est is not None else None)  # add batch dim back
-
+        add_tensor_row("cond_latents = prepare_cond(latents_noisy, task)", cond_latents)
+        add_tensor_row("latents_concat = concat(latents_noisy, cond_latents)", latents_concat)
+        rows.append(("--- UNET / SDS ---", self._scalar_row("Transformer output and SDS grads"), ""))
         # Transformer inputs/outputs
-        add_tensor_row("noise_pred (transformer output)", noise_pred)
+        add_tensor_row("noise_pred = transformer(latents_concat, t, prompts)", noise_pred)
 
         # SDS weights / grads (scalar)
         w_val = float((sigma**2).detach().reshape(-1)[0].item())
-        rows.append(("w = sigma**2", self._scalar_row(f"{w_val:.6f}")))
+        rows.append(("w = sigma**2", self._scalar_row(f"{w_val:.6f}"), ""))
         grad_sample = grad[0].detach()
-        rows.append(("grad = w*(noise_pred-noise) (norm)", self._scalar_row(f"{grad_sample.norm().item():.4f}")))
+        rows.append(("grad = w*(noise_pred-noise) (norm)", self._scalar_row(f"{grad_sample.norm().item():.4f}"), ""))
+        add_tensor_row("grad = w*(noise_pred-noise)", grad)
+        # Grad diagnostics immediately after grad tensor
+        try:
+            g = grad[0].detach().cpu().float()  # C,T,H,W
+            g_abs = g.abs()
+            g_map = g_abs.mean(dim=(0, 1)).numpy()  # H,W
+            heat = _make_heatmap_2d(g_map, label="mean |grad| over C,T")
+            rows.append(("grad_heatmap = mean(|grad| over C,T)", heat, f"shape={heat.shape}"))
+            g_hist = _make_hist_image(g_abs.reshape(-1).numpy(), title="hist |grad|")
+            rows.append(("grad_hist = hist(|grad|)", g_hist, f"shape={g_hist.shape}"))
+            # grad norm history curve with moving average
+            if not hasattr(self, "_grad_norm_hist"):
+                self._grad_norm_hist = []
+            if not hasattr(self, "_grad_norm_window"):
+                self._grad_norm_window = getattr(self.cfg, "debug_video_interval", 50)
+            window = self._grad_norm_window
+            g_norm = float(g.norm().item())
+            self._grad_norm_hist.append(g_norm)
+            vals = np.array(self._grad_norm_hist, dtype=np.float32)
+            smoothed = []
+            for i in range(len(vals)):
+                start = max(0, i - window + 1)
+                smoothed.append(float(vals[start : i + 1].mean()))
+            curve = _make_line_chart(smoothed, title=f"grad_norm MA(window={window})")
+            rows.append(("grad_norm_curve (MA)", curve, f"points={len(smoothed)}"))
+        except Exception as e:
+            shape_logs.append(f"grad viz failed: {e}")
+
+        rows.append(("--- SDS ONE-STEP PREVIEW ---", self._scalar_row("x0_est and 1-step decode"), ""))
+        if sds_x0_est is not None:
+            rows.append(("sds_x0_est = (latents_noisy - sigma*noise)/(1-sigma) stats", self._scalar_row(f"shape={tuple(sds_x0_est.shape)}, min={sds_x0_est.min().item():.4f}, max={sds_x0_est.max().item():.4f}, norm={sds_x0_est.norm().item():.4f}"), ""))
+        if sds_x0_est is not None:
+            add_tensor_row("x0_est = (latents_noisy - sigma*noise)/(1-sigma)", sds_x0_est)
+        else:
+            rows.append(("x0_est = (latents_noisy - sigma*noise)/(1-sigma)", self._scalar_row("x0_est None"), "value"))
+        # Decode a single frame of x0_est for quick inspection
+        try:
+            if sds_x0_est is not None:
+                # sds_x0_est is (B,C,T,H,W); ensure it's on the right device for decode
+                x0_for_decode = sds_x0_est.to(self.device)
+                x0_video = self._decode_latents(x0_for_decode)[0]  # (C,T,H,W)
+                frame0 = x0_video[:, 0].clamp(0, 1)
+                frame0 = torch.nn.functional.interpolate(frame0.unsqueeze(0), size=(128, 128), mode="bilinear", align_corners=False)[0]
+                img_np = (frame0.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                rows.append(("x0_est_frame0 = decode(x0_est)[t=0]", img_np, f"shape={img_np.shape}"))
+        except Exception as e:
+            shape_logs.append(f"x0_est decode failed: {e}")
 
         if prompt_embeds is not None:
-            rows.append(("prompt_embeds", self._scalar_row(f"shape={tuple(prompt_embeds.shape)}, norm={prompt_embeds.norm().item():.3f}")))
+            rows.append(("prompt_embeds = text_encoder(prompt)", self._scalar_row(f"shape={tuple(prompt_embeds.shape)}, norm={prompt_embeds.norm().item():.3f}"), ""))
             shape_logs.append(f"prompt_embeds shape={tuple(prompt_embeds.shape)}, norm={prompt_embeds.norm().item():.3f}")
         if prompt_mask is not None:
-            rows.append(("prompt_mask", self._scalar_row(f"shape={tuple(prompt_mask.shape)}, sum={prompt_mask.sum().item():.3f}")))
+            rows.append(("prompt_mask = attention_mask(prompt)", self._scalar_row(f"shape={tuple(prompt_mask.shape)}, sum={prompt_mask.sum().item():.3f}"), ""))
             shape_logs.append(f"prompt_mask shape={tuple(prompt_mask.shape)}, sum={prompt_mask.sum().item():.3f}")
 
+        rows.append(("--- SDS 1-STEP VIDEO ---", self._scalar_row("Decode x0_est / latents / latents_noisy -> video (bucketed)"), ""))
         # assemble panel
-        # helper to add video rows (pipe / sds1step)
+        # helper to add video rows with optional bucket upsample
         def add_video_row(label: str, vid: Optional[Tensor]):
             if vid is None:
                 return
@@ -636,19 +758,71 @@ class HunyuanVideoGuidance(BaseObject):
                 tiles.append(img)
             grid = torch.cat(tiles, dim=2)  # concat along width
             grid_np = (grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            rows.append((label, grid_np))
+            rows.append((label, grid_np, f"shape={(C, T, H, W)}"))
 
-        add_video_row("pipe video", pipe_frames)
-        add_video_row("sds1step video", sds_frames)
-        add_tensor_row("pipe_latents (decoder input from pipe)", pipe_latents.unsqueeze(0) if pipe_latents is not None else None)
+        def decode_and_bucket(lat: Optional[Tensor]) -> Optional[Tensor]:
+            if lat is None:
+                return None
+            # Ensure latent is on the correct device for VAE decode
+            lat_device = lat.to(self.device)
+            video = self._decode_latents(lat_device)[0]  # (C,T,H,W)
+            # match bucket resolution used elsewhere (pipe/sds_frames)
+            try:
+                target_h, target_w = self.pipe.get_closest_resolution_given_original_size(
+                    origin_size=(rgb.shape[-1], rgb.shape[-2]), target_size=self.cfg.resolution
+                )
+            except Exception:
+                target_h, target_w = rgb.shape[-2], rgb.shape[-1]
+            if video.shape[-2:] != (target_h, target_w):
+                video_thcw = video.permute(1, 0, 2, 3)
+                video_up = torch.nn.functional.interpolate(
+                    video_thcw, size=(target_h, target_w), mode="bilinear", align_corners=False
+                )
+                video = video_up.permute(1, 0, 2, 3)
+            return video
+
+        # x0_est preview: prefer cached sds_frames (already bucketed), else decode and bucket
+        x0_decoded = sds_frames if sds_frames is not None else decode_and_bucket(sds_x0_est if sds_x0_est is not None else None)
+        add_video_row("sds1step video = decode(x0_est)", x0_decoded)
+        add_video_row("sds1step video = decode(latents)", decode_and_bucket(latents))
+        add_video_row("sds1step video = decode(latents_noisy)", decode_and_bucket(latents_noisy))
+
+        rows.append(("--- PIPE PREVIEW (NO SDS) ---", self._scalar_row("Pipeline multi-step decode"), ""))
+        add_tensor_row("pipe_latents = pipe(..., output_type='latent')", pipe_latents.unsqueeze(0) if pipe_latents is not None else None)
+        add_video_row("pipe video = decode(pipe_latents)", pipe_frames)
+
+        # Add [HY-XX] prefix to each row label based on appearance order
+        rows_with_prefix = []
+        for idx, (label, img, shape_text) in enumerate(rows):
+            prefix = f"[HY-{idx:02d}] "
+            rows_with_prefix.append((prefix + label, img, shape_text))
+        rows = rows_with_prefix
 
         panel_imgs = []
-        label_w = 1100  # expanded label column width for readability
-        for label, img in rows:
-            h, w, _ = img.shape
-            canvas = np.ones((h, label_w + w, 3), dtype=np.uint8) * 255
-            canvas[:, label_w:, :] = (img * 255 if img.dtype != np.uint8 else img).astype(np.uint8)
-            cv2.putText(canvas, label, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1, cv2.LINE_AA)
+        label_w = 1500  # expanded label column width for readability
+        shape_w = 500  # column for shape info
+        # Unified font settings (same as _scalar_row)
+        FONT = cv2.FONT_HERSHEY_SIMPLEX
+        FONT_SCALE = 1.2
+        FONT_THICKNESS = 2
+        MIN_ROW_HEIGHT = 40  # minimum height to fit text
+        for label, img, shape_text in rows:
+            if not shape_text:
+                shape_text = "value"
+            h, w = img.shape[:2]
+            if img.ndim == 2:
+                img = np.stack([img, img, img], axis=-1)
+            # Ensure minimum height for text readability
+            row_h = max(h, MIN_ROW_HEIGHT)
+            canvas = np.ones((row_h, label_w + shape_w + w, 3), dtype=np.uint8) * 255
+            # Center image vertically if row is taller than image
+            y_offset = (row_h - h) // 2
+            canvas[y_offset:y_offset+h, label_w + shape_w:, :] = (img * 255 if img.dtype != np.uint8 else img).astype(np.uint8)
+            # Text at vertical center
+            text_y = row_h // 2 + 8
+            cv2.putText(canvas, label, (10, text_y), FONT, FONT_SCALE, (0, 0, 255), FONT_THICKNESS, cv2.LINE_AA)
+            if shape_text:
+                cv2.putText(canvas, shape_text, (label_w + 10, text_y), FONT, FONT_SCALE, (0, 128, 0), FONT_THICKNESS, cv2.LINE_AA)
             panel_imgs.append(canvas)
 
         if panel_imgs:
@@ -660,12 +834,13 @@ class HunyuanVideoGuidance(BaseObject):
                     im = np.pad(im, ((0, 0), (0, pad_w), (0, 0)), mode="constant", constant_values=255)
                 padded.append(im)
             panel = np.concatenate(padded, axis=0)
-        suffix = "_hunyuan"
-        save_path = os.path.join(debug_save_dir, f"it{debug_step}-panel{suffix}.png")
+        save_path = os.path.join(debug_save_dir, f"it{debug_step}-panel_2_hunyuan.png")
         imageio.imwrite(save_path, panel)
+        # cache rows for potential cross-guidance alignment panel
+        self.last_panel_rows = rows
         # log shapes to stdout
         for ln in shape_logs:
-            threestudio.info(f"[panel] {ln}")
+            threestudio.info(f"[panel_hunyuan] {ln}")
 
     @torch.no_grad()
     def _debug_save_videos(
@@ -734,7 +909,7 @@ class HunyuanVideoGuidance(BaseObject):
                 video_pipe = self._decode_latents(latents_pipe)[0]  # (C,T,H,W)
                 video_pipe = _upsample_to_bucket(video_pipe)
                 pipe_path = os.path.join(debug_save_dir, f"it{debug_step}-pipe_hunyuan.mp4")
-                self._save_video_tensor(video_pipe, pipe_path)
+                # self._save_video_tensor(video_pipe, pipe_path)
                 pipe_frames = video_pipe.cpu()
             except Exception as e:
                 threestudio.warn(f"Debug pipe generation failed: {e}")
@@ -753,7 +928,7 @@ class HunyuanVideoGuidance(BaseObject):
                 video_1step = self._decode_latents(x0_est)[0]  # (C,T,H,W)
                 video_1step = _upsample_to_bucket(video_1step)
                 one_step_path = os.path.join(debug_save_dir, f"it{debug_step}-sds1step_hunyuan.mp4")
-                self._save_video_tensor(video_1step, one_step_path)
+                # self._save_video_tensor(video_1step, one_step_path)
                 sds_frames = video_1step.cpu()
                 sds_x0_est = x0_est.detach().cpu()
             except Exception as e:

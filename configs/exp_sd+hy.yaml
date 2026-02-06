@@ -1,5 +1,5 @@
-name: "dreamfusion-sd"
-tag: "${rmspace:${system.prompt_processor.prompt},_}"
+name: "exp-sd-hy"
+tag: ""
 exp_root_dir: "outputs"
 seed: 0
 
@@ -15,36 +15,34 @@ data:
   eval_camera_distance: 2.0
   eval_fovy_deg: 70.
 
-system_type: "dreamfusion-system"
+system_type: "dreamfusion-sd-vs-hunyuan-system"
 system:
+  n_arc_views: 1
+  arc_span_deg: 0.
+  fix_elevation: false
+  arc_direction: "cw"
+  debug_video_interval: 50
+  debug_video_num_steps: 1
+  debug_video_length: null
+  debug_video_use_pipe: true
+  debug_video_use_one_step: true
+
   geometry_type: "implicit-volume"
   geometry:
     radius: 2.0
     normal_type: "analytic"
-
-    # the density initialization proposed in the DreamFusion paper
-    # does not work very well
-    # density_bias: "blob_dreamfusion"
-    # density_activation: exp
-    # density_blob_scale: 5.
-    # density_blob_std: 0.2
-
-    # use Magic3D density initialization instead
     density_bias: "blob_magic3d"
     density_activation: softplus
     density_blob_scale: 10.
     density_blob_std: 0.5
-
-    # coarse to fine hash grid encoding
-    # to ensure smooth analytic normals
     pos_encoding_config:
       otype: ProgressiveBandHashGrid
       n_levels: 16
       n_features_per_level: 2
       log2_hashmap_size: 19
       base_resolution: 16
-      per_level_scale: 1.447269237440378 # max resolution 4096
-      start_level: 8 # resolution ~200
+      per_level_scale: 1.447269237440378
+      start_level: 8
       start_step: 2000
       update_steps: 500
 
@@ -62,18 +60,49 @@ system:
     radius: ${system.geometry.radius}
     num_samples_per_ray: 512
 
-  prompt_processor_type: "stable-diffusion-prompt-processor"
+  prompt_processor_type: "hunyuanvideo-prompt-processor"
   prompt_processor:
-    pretrained_model_name_or_path: "Manojb/stable-diffusion-2-1-base"
-    prompt: ???
+    prompt: "A cinematic video of a hamburger..."
+    view_dependent_prompting: true
 
-  guidance_type: "stable-diffusion-guidance"
-  guidance:
+  # SD guidance (train) + Hunyuan guidance (train)
+  sd_prompt_processor_type: "stable-diffusion-prompt-processor"
+  sd_prompt_processor:
     pretrained_model_name_or_path: "Manojb/stable-diffusion-2-1-base"
-    guidance_scale: 100.
+    prompt: ${system.prompt_processor.prompt}
+    negative_prompt: ""
+    view_dependent_prompting: true
+  sd_guidance_type: "stable-diffusion-guidance-vis"
+  sd_guidance:
+    pretrained_model_name_or_path: "Manojb/stable-diffusion-2-1-base"
+    guidance_scale: 100.0
+    min_step_percent: 0.02
+    max_step_percent: 0.98
+    weighting_strategy: "sds"
+    debug_save_dir: null
+    debug_step: null
+    debug_panel: true
+  sd_render_resolution: [64, 64]
+  sd_guidance_requires_grad: true
+
+  # Hunyuan guidance (train)
+  guidance_type: "hunyuanvideo-guidance"
+  guidance:
+    pretrained_model_name_or_path: "HunyuanVideo-1.5/ckpts"
+    model_type: "t2v"
+    resolution: "480p"
+    task: "t2v"
+    cfg_distilled: true
+    step_distilled: false
+    guidance_scale: 6.
     weighting_strategy: sds
     min_step_percent: 0.02
     max_step_percent: 0.98
+    debug_save_dir: null
+    debug_step: null
+    debug_panel: true
+  hy_render_resolution: [256, 256]
+  hy_guidance_requires_grad: true
 
   loggers:
     wandb:
@@ -103,15 +132,11 @@ trainer:
   max_steps: 10000
   log_every_n_steps: 1
   num_sanity_val_steps: 0
-  val_check_interval: 200
+  val_check_interval: 50
   enable_progress_bar: true
   precision: 16-mixed
 
 checkpoint:
-  save_last: true # save at each validation time
+  save_last: true
   save_top_k: -1
   every_n_train_steps: ${trainer.max_steps}
-
-
-# Run command example:
-# python launch.py --config configs/dreamfusion-sd.yaml --train --gpu 0 system.prompt_processor.prompt="a zoomed out DSLR photo of a baby bunny sitting on top of a stack of pancakes"

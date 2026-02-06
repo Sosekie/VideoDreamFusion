@@ -16,7 +16,8 @@ from threestudio.utils.typing import *
 class StableDiffusionPromptProcessor(PromptProcessor):
     @dataclass
     class Config(PromptProcessor.Config):
-        pass
+        view_dependent_prompting: bool = False
+        negative_prompt: str = ""
 
     cfg: Config
 

@@ -3,6 +3,7 @@ from . import (
     dreamfusion,
     dreamfusion_hunyuanvideo,
     dreamfusion_sd_vs_hunyuan,
+    dreamfusion_sd_only_debug,
     eff_dreamfusion,
     fantasia3d,
     imagedreamfusion,
